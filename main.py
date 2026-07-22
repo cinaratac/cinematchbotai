@@ -136,6 +136,9 @@ if bot:
             "tts_ms": None,
             "tts_ready_ms": None,
             "telegram_voice_upload_ms": None,
+            "tool_call_count": 0,
+            "tool_total_ms": None,
+            "tool_calls": [],
             "ttfb_ms": None,
             "ttfs_ms": None,
             "e2e_ms": None,
@@ -201,15 +204,19 @@ if bot:
 
             current_stage = "ai"
             ai_started = time.perf_counter()
-            answer, _recommended_movies, _session_id = get_ai_response(
+            answer, _recommended_movies, _session_id, diagnostics = get_ai_response(
                 transcript,
                 user_id=message.from_user.id,
                 username=username,
+                include_diagnostics=True,
             )
             metrics["ai_ms"] = round((time.perf_counter() - ai_started) * 1000)
             metrics["ai_ready_ms"] = round((time.perf_counter() - pipeline_started) * 1000)
             metrics["answer_length"] = len(answer)
             metrics["session_id"] = _session_id
+            metrics["tool_call_count"] = diagnostics["tool_call_count"]
+            metrics["tool_total_ms"] = diagnostics["tool_total_ms"]
+            metrics["tool_calls"] = diagnostics["tool_calls"]
 
             current_stage = "telegram_text_send"
             text_send_started = time.perf_counter()
@@ -294,6 +301,9 @@ if bot:
             "ai_ms": None,
             "ai_ready_ms": None,
             "telegram_text_send_ms": None,
+            "tool_call_count": 0,
+            "tool_total_ms": None,
+            "tool_calls": [],
             "ttfb_ms": None,
             "ttfs_ms": None,
             "e2e_ms": None,
@@ -307,16 +317,20 @@ if bot:
 
         try:
             ai_started = time.perf_counter()
-            answer, _recommended_movies, _session_id = get_ai_response(
+            answer, _recommended_movies, _session_id, diagnostics = get_ai_response(
                 message.text,
                 user_id=message.from_user.id,
                 username=username,
+                include_diagnostics=True,
             )
             metrics["ai_ms"] = round((time.perf_counter() - ai_started) * 1000)
             metrics["ai_ready_ms"] = round(
                 (time.perf_counter() - pipeline_started) * 1000
             )
             metrics["session_id"] = _session_id
+            metrics["tool_call_count"] = diagnostics["tool_call_count"]
+            metrics["tool_total_ms"] = diagnostics["tool_total_ms"]
+            metrics["tool_calls"] = diagnostics["tool_calls"]
             metrics["answer_length"] = len(answer)
 
             send_started = time.perf_counter()
@@ -385,6 +399,9 @@ def api_chat():
         "session_id": None,
         "ai_ms": None,
         "ai_ready_ms": None,
+        "tool_call_count": 0,
+        "tool_total_ms": None,
+        "tool_calls": [],
         "ttfb_ms": None,
         "ttfs_ms": None,
         "e2e_ms": None,
@@ -408,18 +425,22 @@ def api_chat():
 
     try:
         ai_started = time.perf_counter()
-        ai_response, recommended_movies, session_id = get_ai_response(
+        ai_response, recommended_movies, session_id, diagnostics = get_ai_response(
             user_message,
             user_id=user_id,
             username=username,
             app_profile=app_profile,
             movie_name=data.get('movie_name') or data.get('movie_title'),
+            include_diagnostics=True,
         )
         metrics["ai_ms"] = round((time.perf_counter() - ai_started) * 1000)
         metrics["ai_ready_ms"] = round(
             (time.perf_counter() - pipeline_started) * 1000
         )
         metrics["session_id"] = session_id
+        metrics["tool_call_count"] = diagnostics["tool_call_count"]
+        metrics["tool_total_ms"] = diagnostics["tool_total_ms"]
+        metrics["tool_calls"] = diagnostics["tool_calls"]
         metrics["answer_length"] = len(ai_response)
         # Flask cevabı streaming değil; backend tarafında TTFB, JSON cevabının
         # dönmeye hazır olduğu andır. Ağ ve istemcide render süresi dahil değildir.

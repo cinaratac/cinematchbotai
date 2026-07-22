@@ -137,12 +137,28 @@ def text_to_speech(text, voice=None):
     return response.content
 
 
-def get_live_movie_data(movie_name, session_id=None, user_id=None, username=None):
+def _record_tool_timing(collector, tool_name, duration_ms, status):
+    if collector is not None:
+        collector.append({
+            "tool_name": tool_name,
+            "duration_ms": duration_ms,
+            "status": status,
+        })
+
+
+def get_live_movie_data(
+    movie_name,
+    session_id=None,
+    user_id=None,
+    username=None,
+    timing_collector=None,
+):
     """Bu fonksiyon OMDb API'ye bağlanıp anlık film verilerini çeker ve loglar.
     session_id/user_id verilirse (normal akışta her zaman verilir), admin
     panelinde bu tool çağrısı ilgili konuşmayla ilişkilendirilerek gösterilir.
     username verilirse admin panelindeki "Tool Çağrıları" tablosunda ekstra
     sorguya gerek kalmadan doğrudan gösterilir."""
+    tool_started = time.perf_counter()
     url = "https://www.omdbapi.com/"
     # Admin logunda API anahtarı görünmesin; gerçek istekte params içine eklenir.
     logged_url = f"{url}?{urlencode({'t': movie_name})}"
@@ -166,15 +182,24 @@ def get_live_movie_data(movie_name, session_id=None, user_id=None, username=None
             "Error": type(e).__name__,
             "message": safe_error_message[:500],
         }, ensure_ascii=False)
+        duration_ms = round((time.perf_counter() - tool_started) * 1000)
+        _record_tool_timing(
+            timing_collector, "get_live_movie_data", duration_ms, "error"
+        )
         log_tool_call(
             session_id, user_id, movie_name, logged_url,
-            logged_response, username=username,
+            logged_response, username=username, duration_ms=duration_ms,
         )
         raise
 
+    duration_ms = round((time.perf_counter() - tool_started) * 1000)
+    tool_status = "success" if data.get("Response") == "True" else "not_found"
+    _record_tool_timing(
+        timing_collector, "get_live_movie_data", duration_ms, tool_status
+    )
     log_tool_call(
         session_id, user_id, movie_name, logged_url,
-        logged_response, username=username,
+        logged_response, username=username, duration_ms=duration_ms,
     )
 
     if data.get("Response") == "True":
@@ -291,8 +316,20 @@ def wants_app_guide(user_message):
     return any(keyword in lowered for keyword in APP_GUIDE_KEYWORDS)
 
 
-def get_cinematch_app_guide(query, session_id=None, user_id=None, username=None):
+def get_cinematch_app_guide(
+    query,
+    session_id=None,
+    user_id=None,
+    username=None,
+    timing_collector=None,
+):
     """CineMatch rehberini döndürür ve internal tool kullanımını loglar."""
+    tool_started = time.perf_counter()
+    guide = CINEMATCH_APP_GUIDE
+    duration_ms = round((time.perf_counter() - tool_started) * 1000)
+    _record_tool_timing(
+        timing_collector, "get_cinematch_app_guide", duration_ms, "success"
+    )
     log_tool_call(
         session_id=session_id,
         user_id=user_id,
@@ -306,8 +343,9 @@ def get_cinematch_app_guide(query, session_id=None, user_id=None, username=None)
         username=username,
         tool_name="get_cinematch_app_guide",
         query=str(query or "")[:500],
+        duration_ms=duration_ms,
     )
-    return CINEMATCH_APP_GUIDE
+    return guide
 
 
 
@@ -460,9 +498,17 @@ def summarize_session(session_id):
 # ANA FONKSİYON
 
 
-def get_ai_response(user_message, user_id="anon", username="anon", app_profile=None, movie_name=None):
+def get_ai_response(
+    user_message,
+    user_id="anon",
+    username="anon",
+    app_profile=None,
+    movie_name=None,
+    include_diagnostics=False,
+):
     # 1. OTURUMU BUL / OLUŞTUR (session bazlı yapı)
     session_id = get_or_create_session(user_id, username)
+    tool_timings = []
 
     # Uygulama sorularında rehberi modelden önce deterministik olarak çağır.
     # Rehber yalnızca ilgili mesajlarda prompt'a eklenir ve admin tool logunda
@@ -475,6 +521,7 @@ def get_ai_response(user_message, user_id="anon", username="anon", app_profile=N
                 session_id=session_id,
                 user_id=user_id,
                 username=username,
+                timing_collector=tool_timings,
             )
         except Exception as e:
             print(f"SİSTEM UYARISI: CineMatch uygulama rehberi loglanamadı: {e}")
@@ -494,6 +541,7 @@ def get_ai_response(user_message, user_id="anon", username="anon", app_profile=N
                 session_id=session_id,
                 user_id=user_id,
                 username=username,
+                timing_collector=tool_timings,
             )
         except Exception as e:
             print(f"SİSTEM UYARISI: OMDb ön sorgusu başarısız: {e}")
@@ -676,7 +724,11 @@ sohbetin doğal devamıymış gibi bak, aynı cümleleri tekrar etme.
                     else:
                         print(f"SİSTEM: Yapay zeka OMDb'den şu filmi çekiyor: {movie_name}")
                         function_result = get_live_movie_data(
-                            movie_name, session_id=session_id, user_id=user_id, username=username
+                            movie_name,
+                            session_id=session_id,
+                            user_id=user_id,
+                            username=username,
+                            timing_collector=tool_timings,
                         )
 
                         messages.append(assistant_message)
@@ -714,6 +766,16 @@ sohbetin doğal devamıymış gibi bak, aynı cümleleri tekrar etme.
     if message_count % SUMMARY_UPDATE_INTERVAL == 0:
         summarize_session(session_id)
 
+    if include_diagnostics:
+        return final_answer, recommended_movies, session_id, {
+            "tool_calls": tool_timings,
+            "tool_call_count": len(tool_timings),
+            "tool_total_ms": (
+                sum(t["duration_ms"] for t in tool_timings)
+                if tool_timings
+                else None
+            ),
+        }
     return final_answer, recommended_movies, session_id
 
 

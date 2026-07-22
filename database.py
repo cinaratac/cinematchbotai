@@ -227,6 +227,7 @@ def log_tool_call(
     username=None,
     tool_name="get_live_movie_data",
     query=None,
+    duration_ms=None,
 ):
     db = _get_db()
     db.collection(COL_API_LOGS).document().set({
@@ -241,6 +242,7 @@ def log_tool_call(
         "username": username,
         "tool_name": tool_name,
         "query": query if query is not None else movie_name,
+        "duration_ms": duration_ms,
         "timestamp": _now(),
     })
 
@@ -346,6 +348,8 @@ def get_admin_overview(days=14):
     )
     successful_tool_calls = 0
     movie_counts = {}
+    movie_duration_sums = {}
+    movie_duration_counts = {}
     for d in tool_docs:
         data = d.to_dict()
         resp = data.get("api_response", "") or ""
@@ -354,8 +358,20 @@ def get_admin_overview(days=14):
         name = data.get("movie_name")
         if name:
             movie_counts[name] = movie_counts.get(name, 0) + 1
+            duration = data.get("duration_ms")
+            if isinstance(duration, (int, float)) and not isinstance(duration, bool):
+                movie_duration_sums[name] = movie_duration_sums.get(name, 0) + duration
+                movie_duration_counts[name] = movie_duration_counts.get(name, 0) + 1
     top_movies = [
-        {"movie_name": k, "c": v}
+        {
+            "movie_name": k,
+            "c": v,
+            "avg_duration_ms": (
+                round(movie_duration_sums[k] / movie_duration_counts[k])
+                if movie_duration_counts.get(k)
+                else None
+            ),
+        }
         for k, v in sorted(movie_counts.items(), key=lambda x: x[1], reverse=True)[:5]
     ]
 
@@ -569,7 +585,7 @@ def add_evaluation(session_id, rating, note='', evaluator=''):
 PERFORMANCE_METRIC_FIELDS = [
     "telegram_download_ms", "asr_ms", "ai_ms", "ai_ready_ms",
     "telegram_text_send_ms", "ttfb_ms", "tts_ms", "tts_ready_ms",
-    "telegram_voice_upload_ms", "ttfs_ms", "e2e_ms",
+    "telegram_voice_upload_ms", "tool_total_ms", "ttfs_ms", "e2e_ms",
 ]
 
 
