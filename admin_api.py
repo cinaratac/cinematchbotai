@@ -135,3 +135,18 @@ def tool_calls():
         "data": calls,
         "pagination": {"limit": limit, "offset": offset, "total": total},
     }), 200
+@admin_bp.route("/performance", methods=["GET"])
+@require_admin_key
+def performance_metrics():
+    limit, offset = _pagination_params()
+
+    metrics = db.get_performance_metrics_admin(limit=limit, offset=offset)
+    total = db.count_performance_metrics_admin()
+    averages = db.get_performance_metrics_averages()
+
+    return jsonify({
+        "status": "success",
+        "data": metrics,
+        "averages": averages,
+        "pagination": {"limit": limit, "offset": offset, "total": total},
+    }), 200

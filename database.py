@@ -524,3 +524,59 @@ def add_evaluation(session_id, rating, note='', evaluator=''):
         "rating_count": firestore.Increment(1),
     })
     return doc_ref.id
+# ============================================================
+# PERFORMANS METRİKLERİ (ADMIN)
+# ============================================================
+
+PERFORMANCE_METRIC_FIELDS = [
+    "telegram_download_ms", "asr_ms", "ai_ms", "ai_ready_ms",
+    "telegram_text_send_ms", "ttfb_ms", "tts_ms", "tts_ready_ms",
+    "telegram_voice_upload_ms", "ttfs_ms", "e2e_ms",
+]
+
+
+def get_performance_metrics_admin(limit=25, offset=0):
+    db = _get_db()
+    query = db.collection(COL_PERFORMANCE_METRICS).order_by(
+        "created_at", direction=firestore.Query.DESCENDING
+    )
+    docs = list(query.limit(limit + offset).stream())[offset:offset + limit]
+
+    results = []
+    for d in docs:
+        data = d.to_dict()
+        row = {"id": d.id, "created_at": _iso(data.get("created_at"))}
+        for f in PERFORMANCE_METRIC_FIELDS:
+            row[f] = data.get(f)
+        results.append(row)
+    return results
+
+
+def count_performance_metrics_admin():
+    db = _get_db()
+    return db.collection(COL_PERFORMANCE_METRICS).count().get()[0][0].value
+
+
+def get_performance_metrics_averages(sample_size=200):
+    """Son sample_size ölçüm üzerinden her metrik için ortalama (ms) döner."""
+    db = _get_db()
+    docs = list(
+        db.collection(COL_PERFORMANCE_METRICS)
+        .order_by("created_at", direction=firestore.Query.DESCENDING)
+        .limit(sample_size)
+        .stream()
+    )
+    sums = {f: 0 for f in PERFORMANCE_METRIC_FIELDS}
+    counts = {f: 0 for f in PERFORMANCE_METRIC_FIELDS}
+    for d in docs:
+        data = d.to_dict()
+        for f in PERFORMANCE_METRIC_FIELDS:
+            v = data.get(f)
+            if isinstance(v, (int, float)):
+                sums[f] += v
+                counts[f] += 1
+
+    return {
+        f: round(sums[f] / counts[f]) if counts[f] else None
+        for f in PERFORMANCE_METRIC_FIELDS
+    }
