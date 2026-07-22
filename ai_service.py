@@ -41,7 +41,10 @@ MODEL_NAME = "google/gemma-4-26b-a4b-it"
 # Alternatif: google/gemini-2.0-flash-001 de benzer şekilde ucuz ve kararlı.
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_TRANSCRIPTIONS_URL = "https://openrouter.ai/api/v1/audio/transcriptions"
+OPENROUTER_SPEECH_URL = "https://openrouter.ai/api/v1/audio/speech"
 ASR_MODEL_NAME = os.environ.get("ASR_MODEL_NAME", "openai/whisper-large-v3")
+TTS_MODEL_NAME = os.environ.get("TTS_MODEL_NAME", "openai/gpt-4o-mini-tts-2025-12-15")
+TTS_VOICE = os.environ.get("TTS_VOICE", "nova")
 
 
 VISION_MODEL_NAME = MODEL_NAME
@@ -93,6 +96,45 @@ def transcribe_audio(audio_bytes, audio_format="ogg", language=None):
     if not transcript:
         raise RuntimeError("Ses anlaşılamadı veya boş bir transkript döndü.")
     return transcript
+
+
+def text_to_speech(text, voice=None):
+    """Metni OpenRouter TTS API ile MP3 ses verisine çevirir."""
+    if not OPENROUTER_API_KEY:
+        raise RuntimeError("OPENROUTER_API_KEY tanımlı değil; ses üretilemiyor.")
+
+    clean_text = str(text or "").strip()
+    if not clean_text:
+        raise ValueError("Seslendirilecek metin boş.")
+
+    response = requests.post(
+        OPENROUTER_SPEECH_URL,
+        headers={
+            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": TTS_MODEL_NAME,
+            "input": clean_text,
+            "voice": voice or TTS_VOICE,
+            "response_format": "mp3",
+            "speed": 1.0,
+        },
+        timeout=90,
+    )
+
+    if not response.ok:
+        try:
+            error_data = response.json()
+            error = error_data.get("error", {})
+            message = error.get("message") if isinstance(error, dict) else None
+        except ValueError:
+            message = None
+        raise RuntimeError(message or f"TTS servisi HTTP {response.status_code} hatası döndürdü.")
+
+    if not response.content:
+        raise RuntimeError("TTS servisi boş ses verisi döndürdü.")
+    return response.content
 
 
 def get_live_movie_data(movie_name, session_id=None, user_id=None, username=None):

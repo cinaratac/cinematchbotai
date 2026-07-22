@@ -1,9 +1,10 @@
 import base64
 import os
+from io import BytesIO
 import telebot
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from ai_service import get_ai_response, analyze_image, transcribe_audio
+from ai_service import get_ai_response, analyze_image, transcribe_audio, text_to_speech
 from admin_api import admin_bp
 from database import setup_database, get_session_admin_detail, add_evaluation
 
@@ -143,6 +144,20 @@ if bot:
                 message_id=msg.message_id,
                 text=f"🎙️ {transcript}\n\n{answer}",
             )
+
+            # Yazılı cevap kullanıcıda kalır; TTS ayrıca MP3 olarak gönderilir.
+            # TTS tek başına hata verirse başarılı ASR/AI cevabını bozma.
+            try:
+                speech_bytes = text_to_speech(answer)
+                speech_file = BytesIO(speech_bytes)
+                speech_file.name = "cinebot-cevap.mp3"
+                bot.send_voice(
+                    chat_id=message.chat.id,
+                    voice=speech_file,
+                    reply_to_message_id=message.message_id,
+                )
+            except Exception as tts_error:
+                print("TTS HATASI:", tts_error)
         except Exception as e:
             print("SES İŞLEME HATASI:", e)
             bot.edit_message_text(
