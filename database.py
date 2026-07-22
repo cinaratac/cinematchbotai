@@ -218,7 +218,16 @@ def get_user_history(user_id, current_session_id, max_past_sessions=3):
 # TOOL (ARAÇ) ÇAĞRI LOGLARI
 # ============================================================
 
-def log_tool_call(session_id, user_id, movie_name, api_endpoint, api_response, username=None):
+def log_tool_call(
+    session_id,
+    user_id,
+    movie_name,
+    api_endpoint,
+    api_response,
+    username=None,
+    tool_name="get_live_movie_data",
+    query=None,
+):
     db = _get_db()
     db.collection(COL_API_LOGS).document().set({
         "movie_name": movie_name,
@@ -230,6 +239,8 @@ def log_tool_call(session_id, user_id, movie_name, api_endpoint, api_response, u
         # göstermek için oturum başına ekstra bir sorgu atmıyor, doğrudan burada
         # denormalize edilmiş halde saklanıyor.
         "username": username,
+        "tool_name": tool_name,
+        "query": query if query is not None else movie_name,
         "timestamp": _now(),
     })
 

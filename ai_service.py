@@ -255,12 +255,6 @@ _EXPLICIT_MOVIE_PATTERNS = [
         r"(?:hakkında|nasıl(?:dır)?\b|sence\b|iyi\s+mi\b|kötü\s+mü\b)",
         re.IGNORECASE,
     ),
-    # Inception nasıl? / Inception hakkında ne düşünüyorsun?
-    re.compile(
-        r"^\s*(.{1,120}?)\s+"
-        r"(?:hakkında\s+(?:ne\s+düşünüyorsun|bilgi)|nasıl(?:dır)?\??\s*$|sence\s+nasıl)",
-        re.IGNORECASE,
-    ),
 ]
 
 
@@ -280,6 +274,40 @@ def extract_explicit_movie_title(user_message):
             if title:
                 return title
     return None
+
+
+APP_GUIDE_KEYWORDS = [
+    "cinematch", "uygulama", "profil", "kullanıcı adı", "kullanici adi",
+    "bildirim", "ayarlar", "eşleş", "esles", "sinefil", "mesajlar",
+    "kulüp", "kulup", "letterboxd", "izleme listesi", "favoriler",
+    "rozet", "liderlik", "trivia", "feed", "hesabı sil", "hesabi sil",
+    "şifre", "sifre", "engellenen kullanıcı", "engellenen kullanici",
+]
+
+
+def wants_app_guide(user_message):
+    """Mesajın CineMatch uygulamasının kullanımına ilişkin olup olmadığını bulur."""
+    lowered = str(user_message or "").lower()
+    return any(keyword in lowered for keyword in APP_GUIDE_KEYWORDS)
+
+
+def get_cinematch_app_guide(query, session_id=None, user_id=None, username=None):
+    """CineMatch rehberini döndürür ve internal tool kullanımını loglar."""
+    log_tool_call(
+        session_id=session_id,
+        user_id=user_id,
+        movie_name=None,
+        api_endpoint="internal://cinematch-app-guide",
+        api_response=json.dumps({
+            "Response": "True",
+            "source": "app_guide.py",
+            "query": str(query or "")[:500],
+        }, ensure_ascii=False),
+        username=username,
+        tool_name="get_cinematch_app_guide",
+        query=str(query or "")[:500],
+    )
+    return CINEMATCH_APP_GUIDE
 
 
 
@@ -436,6 +464,23 @@ def get_ai_response(user_message, user_id="anon", username="anon", app_profile=N
     # 1. OTURUMU BUL / OLUŞTUR (session bazlı yapı)
     session_id = get_or_create_session(user_id, username)
 
+    # Uygulama sorularında rehberi modelden önce deterministik olarak çağır.
+    # Rehber yalnızca ilgili mesajlarda prompt'a eklenir ve admin tool logunda
+    # get_cinematch_app_guide adıyla görünür.
+    app_guide_context = None
+    if wants_app_guide(user_message):
+        try:
+            app_guide_context = get_cinematch_app_guide(
+                user_message,
+                session_id=session_id,
+                user_id=user_id,
+                username=username,
+            )
+        except Exception as e:
+            print(f"SİSTEM UYARISI: CineMatch uygulama rehberi loglanamadı: {e}")
+            # Firestore log hatası kullanıcıya doğru cevap verilmesini engellemesin.
+            app_guide_context = CINEMATCH_APP_GUIDE
+
     # Film adı istemci tarafından açıkça gönderildiyse veya mesajdaki güvenli
     # bir kalıptan çıkarılabildiyse, model cevap üretmeden ÖNCE OMDb'yi çağır.
     # Böylece çağrı modelin tool kullanma tercihine bağlı kalmaz ve admin
@@ -544,7 +589,7 @@ CİNEMATCH ZEVK PROFİLİ (uygulamadan gelen kesin veri):
 {app_profile_context if app_profile_context else "Uygulamadan gelen kayıtlı bir zevk profili yok."}
 
 CİNEMATCH UYGULAMA REHBERİ (uygulamanın kendisi hakkında sorular için kesin kaynak):
-{CINEMATCH_APP_GUIDE}
+{app_guide_context if app_guide_context else "Bu mesaj uygulama rehberi gerektirmediği için rehber tool'u çağrılmadı."}
 
 KULLANICI GEÇMİŞİ (arka plan - eski oturumlar / bu oturumun eski kısmı):
 {background_context}
@@ -597,7 +642,9 @@ sohbetin doğal devamıymış gibi bak, aynı cümleleri tekrar etme.
 
         # OMDb verisi önceden çekildiyse aynı filmi modelin tekrar tool ile
         # sorgulamasını engelle; mevcut veri doğrudan system prompt'tadır.
-        available_tools = None if prefetched_movie_data else tools
+        # Uygulama rehberi çağrılmışsa film aracı bu turda modele hiç verilmez;
+        # böylece model "uygulama" gibi kelimeleri film adı sanıp OMDb arayamaz.
+        available_tools = None if (prefetched_movie_data or app_guide_context) else tools
         response_data = _call_openrouter(messages, tools=available_tools, tool_choice=forced_tool_choice)
 
         if 'choices' not in response_data:
