@@ -241,6 +241,22 @@ def log_performance_metric(metric):
     eklenir. Mesaj/transkript/ses içeriği bu koleksiyona yazılmamalıdır.
     """
     payload = dict(metric)
+    ai_ms = payload.get("ai_ms")
+    ttfb_ms = payload.get("ttfb_ms")
+    ttfs_ms = payload.get("ttfs_ms")
+    e2e_ms = payload.get("e2e_ms")
+    numeric = lambda value: isinstance(value, (int, float)) and not isinstance(value, bool)
+
+    invariant_errors = []
+    if numeric(ai_ms) and numeric(e2e_ms) and e2e_ms < ai_ms:
+        invariant_errors.append("e2e_ms_lt_ai_ms")
+    if numeric(ttfb_ms) and numeric(e2e_ms) and e2e_ms < ttfb_ms:
+        invariant_errors.append("e2e_ms_lt_ttfb_ms")
+    if numeric(ttfs_ms) and numeric(e2e_ms) and e2e_ms < ttfs_ms:
+        invariant_errors.append("e2e_ms_lt_ttfs_ms")
+
+    payload["measurement_valid"] = not invariant_errors
+    payload["measurement_errors"] = invariant_errors
     payload["created_at"] = _now()
     return _get_db().collection(COL_PERFORMANCE_METRICS).document().set(payload)
 
@@ -545,7 +561,16 @@ def get_performance_metrics_admin(limit=25, offset=0):
     results = []
     for d in docs:
         data = d.to_dict()
-        row = {"id": d.id, "created_at": _iso(data.get("created_at"))}
+        row = {
+            "id": d.id,
+            "created_at": _iso(data.get("created_at")),
+            "channel": data.get("channel"),
+            "input_type": data.get("input_type"),
+            "status": data.get("status"),
+            "failed_stage": data.get("failed_stage"),
+            "measurement_valid": data.get("measurement_valid", True),
+            "measurement_errors": data.get("measurement_errors", []),
+        }
         for f in PERFORMANCE_METRIC_FIELDS:
             row[f] = data.get(f)
         results.append(row)
@@ -558,25 +583,61 @@ def count_performance_metrics_admin():
 
 
 def get_performance_metrics_averages(sample_size=200):
-    """Son sample_size ölçüm üzerinden her metrik için ortalama (ms) döner."""
+    """Aynı geçerli başarı kohortu üzerinden karşılaştırılabilir ortalamalar.
+
+    AI, TTFB ve E2E alanları farklı belge kümelerinden hesaplanırsa E2E
+    ortalaması AI ortalamasından kısa çıkabilir. Bu nedenle ortalamaya yalnızca
+    üç temel alanı da dolu, başarılı ve süre değişmezlerini sağlayan belgeler
+    alınır. Eski/bozuk belgeler ortalamayı etkilemez.
+    """
     db = _get_db()
     docs = list(
         db.collection(COL_PERFORMANCE_METRICS)
         .order_by("created_at", direction=firestore.Query.DESCENDING)
-        .limit(sample_size)
+        # Hatalı/eksik kayıtları eledikten sonra da yeterli örnek kalabilsin.
+        .limit(max(sample_size * 5, sample_size))
         .stream()
     )
-    sums = {f: 0 for f in PERFORMANCE_METRIC_FIELDS}
-    counts = {f: 0 for f in PERFORMANCE_METRIC_FIELDS}
+
+    def is_number(value):
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+    eligible = []
+    excluded_count = 0
     for d in docs:
         data = d.to_dict()
+        ai_ms = data.get("ai_ms")
+        ttfb_ms = data.get("ttfb_ms")
+        e2e_ms = data.get("e2e_ms")
+        valid = (
+            data.get("status") == "success"
+            and data.get("measurement_valid", True) is not False
+            and is_number(ai_ms)
+            and is_number(ttfb_ms)
+            and is_number(e2e_ms)
+            and e2e_ms >= ai_ms
+            and e2e_ms >= ttfb_ms
+        )
+        if valid:
+            eligible.append(data)
+            if len(eligible) >= sample_size:
+                break
+        else:
+            excluded_count += 1
+
+    sums = {f: 0 for f in PERFORMANCE_METRIC_FIELDS}
+    counts = {f: 0 for f in PERFORMANCE_METRIC_FIELDS}
+    for data in eligible:
         for f in PERFORMANCE_METRIC_FIELDS:
             v = data.get(f)
-            if isinstance(v, (int, float)):
+            if is_number(v):
                 sums[f] += v
                 counts[f] += 1
 
-    return {
+    averages = {
         f: round(sums[f] / counts[f]) if counts[f] else None
         for f in PERFORMANCE_METRIC_FIELDS
     }
+    averages["_sample_count"] = len(eligible)
+    averages["_excluded_count"] = excluded_count
+    return averages
