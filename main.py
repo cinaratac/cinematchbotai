@@ -198,6 +198,7 @@ def api_chat():
             user_id=user_id,
             username=username,
             app_profile=app_profile,
+            movie_name=data.get('movie_name') or data.get('movie_title'),
         )
         print("LOG BAŞARILI: API isteği Firestore veritabanına kaydedildi.")
         return jsonify({

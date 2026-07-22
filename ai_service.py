@@ -4,6 +4,7 @@ import re
 import time
 import requests
 import json
+from urllib.parse import urlencode
 
 from database import (
     get_or_create_session,
@@ -100,12 +101,39 @@ def get_live_movie_data(movie_name, session_id=None, user_id=None, username=None
     panelinde bu tool çağrısı ilgili konuşmayla ilişkilendirilerek gösterilir.
     username verilirse admin panelindeki "Tool Çağrıları" tablosunda ekstra
     sorguya gerek kalmadan doğrudan gösterilir."""
-    url = f"http://www.omdbapi.com/?t={movie_name}&apikey={OMDB_API_KEY}"
+    url = "https://www.omdbapi.com/"
+    # Admin logunda API anahtarı görünmesin; gerçek istekte params içine eklenir.
+    logged_url = f"{url}?{urlencode({'t': movie_name})}"
+    try:
+        response = requests.get(
+            url,
+            params={"t": movie_name, "apikey": OMDB_API_KEY},
+            timeout=15,
+        )
+        response.raise_for_status()
+        data = response.json()
+        logged_response = json.dumps(data, ensure_ascii=False)
+    except Exception as e:
+        # Başarısız çağrılar da admin panelindeki Tool Çağrıları bölümünde
+        # görülsün; aksi halde çağrı hiç yapılmamış gibi görünüyordu.
+        safe_error_message = str(e)
+        if OMDB_API_KEY:
+            safe_error_message = safe_error_message.replace(OMDB_API_KEY, "[REDACTED]")
+        logged_response = json.dumps({
+            "Response": "False",
+            "Error": type(e).__name__,
+            "message": safe_error_message[:500],
+        }, ensure_ascii=False)
+        log_tool_call(
+            session_id, user_id, movie_name, logged_url,
+            logged_response, username=username,
+        )
+        raise
 
-    response = requests.get(url)
-    data = response.json()
-
-    log_tool_call(session_id, user_id, movie_name, url, json.dumps(data, ensure_ascii=False), username=username)
+    log_tool_call(
+        session_id, user_id, movie_name, logged_url,
+        logged_response, username=username,
+    )
 
     if data.get("Response") == "True":
         return (f"Film: {data.get('Title')}, "
@@ -170,6 +198,46 @@ def wants_movie_facts(user_message):
     somut bir film verisi istendiğine dair bir işaret var mı?"""
     lowered = user_message.lower()
     return any(keyword in lowered for keyword in MOVIE_FACT_KEYWORDS)
+
+
+_EXPLICIT_MOVIE_PATTERNS = [
+    # Tırnak içine alınmış başlık: "Inception" hakkında ne düşünüyorsun?
+    re.compile(
+        r"^[^\"“”']*[\"“”']([^\"“”']{1,120})[\"“”']\s*"
+        r"(?:filmi\s+)?(?:hakkında|nasıl|sence|imdb|puan|gişe|çıkış)",
+        re.IGNORECASE,
+    ),
+    # Inception filmi/dizisi hakkında... / Inception filmi nasıl?
+    re.compile(
+        r"^\s*(.{1,120}?)\s+(?:filmi|dizisi)\s+"
+        r"(?:hakkında|nasıl(?:dır)?\b|sence\b|iyi\s+mi\b|kötü\s+mü\b)",
+        re.IGNORECASE,
+    ),
+    # Inception nasıl? / Inception hakkında ne düşünüyorsun?
+    re.compile(
+        r"^\s*(.{1,120}?)\s+"
+        r"(?:hakkında\s+(?:ne\s+düşünüyorsun|bilgi)|nasıl(?:dır)?\??\s*$|sence\s+nasıl)",
+        re.IGNORECASE,
+    ),
+]
+
+
+def extract_explicit_movie_title(user_message):
+    """Açıkça tek bir filme yönelen basit mesajlardan başlığı çıkarır.
+
+    Serbest doğal dilde kusursuz film-adı tespiti mümkün olmadığı için yalnızca
+    yanlış pozitif üretme ihtimali düşük kalıplar kabul edilir. Uygulama film
+    kartından soru gönderiyorsa ``movie_name`` alanını ayrıca göndermesi daha
+    güvenilirdir.
+    """
+    text = str(user_message or "").strip()
+    for pattern in _EXPLICIT_MOVIE_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            title = match.group(1).strip(" \t\n.,!?;:\"'“”")
+            if title:
+                return title
+    return None
 
 
 
@@ -322,9 +390,26 @@ def summarize_session(session_id):
 # ANA FONKSİYON
 
 
-def get_ai_response(user_message, user_id="anon", username="anon", app_profile=None):
+def get_ai_response(user_message, user_id="anon", username="anon", app_profile=None, movie_name=None):
     # 1. OTURUMU BUL / OLUŞTUR (session bazlı yapı)
     session_id = get_or_create_session(user_id, username)
+
+    # Film adı istemci tarafından açıkça gönderildiyse veya mesajdaki güvenli
+    # bir kalıptan çıkarılabildiyse, model cevap üretmeden ÖNCE OMDb'yi çağır.
+    # Böylece çağrı modelin tool kullanma tercihine bağlı kalmaz ve admin
+    # panelindeki Tool Çağrıları bölümüne her zaman loglanır.
+    explicit_movie_name = str(movie_name or "").strip() or extract_explicit_movie_title(user_message)
+    prefetched_movie_data = None
+    if explicit_movie_name:
+        try:
+            prefetched_movie_data = get_live_movie_data(
+                explicit_movie_name,
+                session_id=session_id,
+                user_id=user_id,
+                username=username,
+            )
+        except Exception as e:
+            print(f"SİSTEM UYARISI: OMDb ön sorgusu başarısız: {e}")
 
     # 2. BASİT BİLGİ ÇIKARIMI: mesajda isim gibi kesin bir bilgi varsa kalıcı profile hemen kaydet 
     new_facts = extract_simple_facts(user_message)
@@ -422,6 +507,9 @@ CİNEMATCH UYGULAMA REHBERİ (uygulamanın kendisi hakkında sorular için kesin
 KULLANICI GEÇMİŞİ (arka plan - eski oturumlar / bu oturumun eski kısmı):
 {background_context}
 
+ÖNCEDEN ÇEKİLMİŞ OMDb VERİSİ:
+{prefetched_movie_data if prefetched_movie_data else "Bu mesaj için önceden çekilmiş OMDb verisi yok."}
+
 Not: Bu oturumun SON mesajları, bu sistem talimatından sonra gerçek konuşma
 turları (user/assistant) olarak sana ayrıca gösteriliyor; onlara normal bir
 sohbetin doğal devamıymış gibi bak, aynı cümleleri tekrar etme.
@@ -461,11 +549,14 @@ sohbetin doğal devamıymış gibi bak, aynı cümleleri tekrar etme.
     try:
         # Kullanıcı puan/gişe/yıl gibi somut bir veri istiyorsa, modele "istersen çağır" demek yerine aracı DOĞRUDAN ZORUNLU kılıyoruz. 
         forced_tool_choice = None
-        if wants_movie_facts(user_message):
+        if not prefetched_movie_data and wants_movie_facts(user_message):
             forced_tool_choice = {"type": "function", "function": {"name": "get_live_movie_data"}}
             print("SİSTEM: Kullanıcı somut film verisi istiyor -> get_live_movie_data ZORUNLU kılındı.")
 
-        response_data = _call_openrouter(messages, tools=tools, tool_choice=forced_tool_choice)
+        # OMDb verisi önceden çekildiyse aynı filmi modelin tekrar tool ile
+        # sorgulamasını engelle; mevcut veri doğrudan system prompt'tadır.
+        available_tools = None if prefetched_movie_data else tools
+        response_data = _call_openrouter(messages, tools=available_tools, tool_choice=forced_tool_choice)
 
         if 'choices' not in response_data:
             error_info = response_data.get('error', {})
