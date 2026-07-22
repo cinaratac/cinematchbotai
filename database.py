@@ -709,4 +709,14 @@ def get_performance_metrics_averages(sample_size=200, session_id=None):
     }
     averages["_sample_count"] = len(eligible)
     averages["_excluded_count"] = excluded_count
+    # Aynı Firestore okumasından gelen noktalar frontend'de dakika/saat/gün
+    # bazında gruplanır. Bunun için ek bir Firestore sorgusu yapılmaz.
+    averages["_e2e_points"] = [
+        {
+            "created_at": _iso(data.get("created_at")),
+            "e2e_ms": data.get("e2e_ms"),
+        }
+        for data in eligible
+        if data.get("created_at") is not None and is_number(data.get("e2e_ms"))
+    ]
     return averages
