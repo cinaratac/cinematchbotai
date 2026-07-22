@@ -139,14 +139,18 @@ def tool_calls():
 @require_admin_key
 def performance_metrics():
     limit, offset = _pagination_params()
+    session_id = request.args.get("session_id") or None
 
-    metrics = db.get_performance_metrics_admin(limit=limit, offset=offset)
-    total = db.count_performance_metrics_admin()
-    averages = db.get_performance_metrics_averages()
+    metrics = db.get_performance_metrics_admin(
+        limit=limit, offset=offset, session_id=session_id
+    )
+    total = db.count_performance_metrics_admin(session_id=session_id)
+    averages = db.get_performance_metrics_averages(session_id=session_id)
 
     return jsonify({
         "status": "success",
         "data": metrics,
         "averages": averages,
+        "session_id": session_id,
         "pagination": {"limit": limit, "offset": offset, "total": total},
     }), 200

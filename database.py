@@ -501,6 +501,15 @@ def get_session_admin_detail(session_id):
         evaluations.append({"id": d.id, **row})
 
     user_facts = get_user_facts(session.get("user_id"))
+    performance_metrics = get_performance_metrics_admin(
+        limit=100,
+        offset=0,
+        session_id=session_id,
+    )
+    performance_averages = get_performance_metrics_averages(
+        sample_size=200,
+        session_id=session_id,
+    )
 
     return {
         "session": session,
@@ -508,6 +517,8 @@ def get_session_admin_detail(session_id):
         "tool_calls": tool_calls,
         "evaluations": evaluations,
         "user_facts": user_facts,
+        "performance_metrics": performance_metrics,
+        "performance_averages": performance_averages,
     }
 
 
@@ -562,12 +573,43 @@ PERFORMANCE_METRIC_FIELDS = [
 ]
 
 
-def get_performance_metrics_admin(limit=25, offset=0):
+def _get_performance_metric_docs(session_id=None, scan_limit=None):
+    """Performans belgelerini en yeniden eskiye getirir.
+
+    Session filtresi Python tarafında sıralanır; böylece Firestore'da
+    session_id + created_at birleşik indeksine ihtiyaç duyulmaz.
+    """
     db = _get_db()
-    query = db.collection(COL_PERFORMANCE_METRICS).order_by(
+    collection = db.collection(COL_PERFORMANCE_METRICS)
+    if session_id:
+        docs = list(
+            collection
+            .where(filter=FieldFilter("session_id", "==", session_id))
+            .stream()
+        )
+        docs.sort(
+            key=lambda d: (
+                d.to_dict().get("created_at").timestamp()
+                if isinstance(d.to_dict().get("created_at"), datetime)
+                else 0
+            ),
+            reverse=True,
+        )
+        return docs[:scan_limit] if scan_limit is not None else docs
+
+    query = collection.order_by(
         "created_at", direction=firestore.Query.DESCENDING
     )
-    docs = list(query.limit(limit + offset).stream())[offset:offset + limit]
+    if scan_limit is not None:
+        query = query.limit(scan_limit)
+    return list(query.stream())
+
+
+def get_performance_metrics_admin(limit=25, offset=0, session_id=None):
+    docs = _get_performance_metric_docs(
+        session_id=session_id,
+        scan_limit=limit + offset,
+    )[offset:offset + limit]
 
     results = []
     for d in docs:
@@ -588,12 +630,15 @@ def get_performance_metrics_admin(limit=25, offset=0):
     return results
 
 
-def count_performance_metrics_admin():
+def count_performance_metrics_admin(session_id=None):
     db = _get_db()
-    return db.collection(COL_PERFORMANCE_METRICS).count().get()[0][0].value
+    query = db.collection(COL_PERFORMANCE_METRICS)
+    if session_id:
+        query = query.where(filter=FieldFilter("session_id", "==", session_id))
+    return query.count().get()[0][0].value
 
 
-def get_performance_metrics_averages(sample_size=200):
+def get_performance_metrics_averages(sample_size=200, session_id=None):
     """Aynı geçerli başarı kohortu üzerinden karşılaştırılabilir ortalamalar.
 
     AI, TTFB ve E2E alanları farklı belge kümelerinden hesaplanırsa E2E
@@ -601,13 +646,10 @@ def get_performance_metrics_averages(sample_size=200):
     üç temel alanı da dolu, başarılı ve süre değişmezlerini sağlayan belgeler
     alınır. Eski/bozuk belgeler ortalamayı etkilemez.
     """
-    db = _get_db()
-    docs = list(
-        db.collection(COL_PERFORMANCE_METRICS)
-        .order_by("created_at", direction=firestore.Query.DESCENDING)
+    docs = _get_performance_metric_docs(
+        session_id=session_id,
         # Hatalı/eksik kayıtları eledikten sonra da yeterli örnek kalabilsin.
-        .limit(max(sample_size * 5, sample_size))
-        .stream()
+        scan_limit=max(sample_size * 5, sample_size),
     )
 
     def is_number(value):
