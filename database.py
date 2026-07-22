@@ -43,6 +43,7 @@ COL_CHAT_LOGS = "bot_chat_logs"
 COL_USER_PROFILE = "bot_user_profiles"
 COL_API_LOGS = "bot_api_logs"
 COL_EVALUATIONS = "bot_evaluations"
+COL_PERFORMANCE_METRICS = "bot_performance_metrics"
 
 
 def _now():
@@ -231,6 +232,17 @@ def log_tool_call(session_id, user_id, movie_name, api_endpoint, api_response, u
         "username": username,
         "timestamp": _now(),
     })
+
+
+def log_performance_metric(metric):
+    """Bir pipeline ölçümünü ayrı Firestore koleksiyonuna kaydeder.
+
+    Çağıran kodun hazırladığı sözlük kopyalanır; zaman damgası sunucu tarafında
+    eklenir. Mesaj/transkript/ses içeriği bu koleksiyona yazılmamalıdır.
+    """
+    payload = dict(metric)
+    payload["created_at"] = _now()
+    return _get_db().collection(COL_PERFORMANCE_METRICS).document().set(payload)
 
 
 # ============================================================

@@ -16,3 +16,16 @@ Başlatma adımları
 2- terminale " ngrok http 5001 " yaz sistemi kapıda bekletmeye başla
 3- http://127.0.0.1:5001/ linkine git ve kapıyı aç
 
+koleksyon:bot_performance_metrics
+Metriklerin anlamı:
+telegram_download_ms: Ses dosyasının Telegram’dan indirilmesi
+asr_ms: Sesin yazıya çevrilmesi
+ai_ms: Firestore geçmişi ve AI cevabının üretilmesi
+ai_ready_ms: Pipeline başlangıcından yazılı AI cevabının hazır olmasına kadar
+telegram_text_send_ms: Yazılı cevabın Telegram’a gönderilmesi
+ttfb_ms: İlk gerçek yazılı cevabın Telegram tarafından kabul edilmesi
+tts_ms: AI cevabının MP3’e dönüştürülmesi
+tts_ready_ms: Pipeline başlangıcından MP3’ün hazır olmasına kadar
+telegram_voice_upload_ms: MP3’ün Telegram’a yüklenmesi
+ttfs_ms: Sesli cevabın Telegram tarafından kabul edilmesi
+e2e_ms: Webhook işlenmeye başladıktan sesli cevap gönderilene kadar tüm pipeline

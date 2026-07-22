@@ -1,12 +1,26 @@
 import base64
 import os
+import time
 from io import BytesIO
 import telebot
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from ai_service import get_ai_response, analyze_image, transcribe_audio, text_to_speech
+from ai_service import (
+    ASR_MODEL_NAME,
+    MODEL_NAME,
+    TTS_MODEL_NAME,
+    get_ai_response,
+    analyze_image,
+    transcribe_audio,
+    text_to_speech,
+)
 from admin_api import admin_bp
-from database import setup_database, get_session_admin_detail, add_evaluation
+from database import (
+    setup_database,
+    get_session_admin_detail,
+    add_evaluation,
+    log_performance_metric,
+)
 
 
 # --- GİZLİ ANAHTARLAR (Görev 11): artık koddan değil ortam değişkenlerinden
@@ -106,13 +120,59 @@ if bot:
     @bot.message_handler(content_types=['voice', 'audio'])
     def handle_audio(message):
         """Telegram voice/ses dosyasını yazıya çevirip normal sohbet akışına verir."""
+        pipeline_started = time.perf_counter()
+        current_stage = "telegram_ack"
+        metrics = {
+            "channel": "telegram",
+            "input_type": message.content_type,
+            "user_id": str(message.from_user.id),
+            "username": message.from_user.username or message.from_user.first_name,
+            "session_id": None,
+            "telegram_download_ms": None,
+            "asr_ms": None,
+            "ai_ms": None,
+            "ai_ready_ms": None,
+            "telegram_text_send_ms": None,
+            "tts_ms": None,
+            "tts_ready_ms": None,
+            "telegram_voice_upload_ms": None,
+            "ttfb_ms": None,
+            "ttfs_ms": None,
+            "e2e_ms": None,
+            "audio_duration_seconds": None,
+            "audio_size_bytes": None,
+            "transcript_length": None,
+            "answer_length": None,
+            "asr_model": ASR_MODEL_NAME,
+            "ai_model": MODEL_NAME,
+            "tts_model": TTS_MODEL_NAME,
+            "status": "started",
+            "failed_stage": None,
+            "error_type": None,
+        }
+
+        def save_metrics():
+            """Ölçüm kaydı hatası kullanıcı cevabını bozmasın."""
+            try:
+                log_performance_metric(metrics)
+            except Exception as metric_error:
+                print("PERFORMANS LOG HATASI:", metric_error)
+
         msg = bot.reply_to(message, "Sesini dinliyorum...")
         username = message.from_user.username or message.from_user.first_name
 
         try:
             media = message.voice if message.content_type == 'voice' else message.audio
+            metrics["audio_duration_seconds"] = getattr(media, "duration", None)
+
+            current_stage = "telegram_download"
+            download_started = time.perf_counter()
             file_info = bot.get_file(media.file_id)
             audio_bytes = bot.download_file(file_info.file_path)
+            metrics["telegram_download_ms"] = round(
+                (time.perf_counter() - download_started) * 1000
+            )
+            metrics["audio_size_bytes"] = len(audio_bytes)
 
             # Telegram voice mesajları OGG/Opus'tur. Normal audio mesajlarında
             # dosya uzantısını STT API'nin beklediği format bilgisi olarak kullan.
@@ -133,33 +193,85 @@ if bot:
                 }.get(getattr(media, 'mime_type', None))
                 audio_format = extension or mime_format or 'mp3'
 
+            current_stage = "asr"
+            asr_started = time.perf_counter()
             transcript = transcribe_audio(audio_bytes, audio_format=audio_format)
+            metrics["asr_ms"] = round((time.perf_counter() - asr_started) * 1000)
+            metrics["transcript_length"] = len(transcript)
+
+            current_stage = "ai"
+            ai_started = time.perf_counter()
             answer, _recommended_movies, _session_id = get_ai_response(
                 transcript,
                 user_id=message.from_user.id,
                 username=username,
             )
+            metrics["ai_ms"] = round((time.perf_counter() - ai_started) * 1000)
+            metrics["ai_ready_ms"] = round((time.perf_counter() - pipeline_started) * 1000)
+            metrics["answer_length"] = len(answer)
+            metrics["session_id"] = _session_id
+
+            current_stage = "telegram_text_send"
+            text_send_started = time.perf_counter()
             bot.edit_message_text(
                 chat_id=message.chat.id,
                 message_id=msg.message_id,
                 text=f"🎙️ {transcript}\n\n{answer}",
             )
+            metrics["telegram_text_send_ms"] = round(
+                (time.perf_counter() - text_send_started) * 1000
+            )
+            # Telegram akışında TTFB: işlem başlangıcından ilk gerçek yazılı
+            # cevabın Telegram API tarafından kabul edilmesine kadar geçen süre.
+            metrics["ttfb_ms"] = round((time.perf_counter() - pipeline_started) * 1000)
 
             # Yazılı cevap kullanıcıda kalır; TTS ayrıca MP3 olarak gönderilir.
             # TTS tek başına hata verirse başarılı ASR/AI cevabını bozma.
             try:
+                current_stage = "tts"
+                tts_started = time.perf_counter()
                 speech_bytes = text_to_speech(answer)
+                metrics["tts_ms"] = round((time.perf_counter() - tts_started) * 1000)
+                metrics["tts_ready_ms"] = round(
+                    (time.perf_counter() - pipeline_started) * 1000
+                )
                 speech_file = BytesIO(speech_bytes)
                 speech_file.name = "cinebot-cevap.mp3"
+
+                current_stage = "telegram_voice_upload"
+                voice_upload_started = time.perf_counter()
                 bot.send_voice(
                     chat_id=message.chat.id,
                     voice=speech_file,
                     reply_to_message_id=message.message_id,
                 )
+                metrics["telegram_voice_upload_ms"] = round(
+                    (time.perf_counter() - voice_upload_started) * 1000
+                )
+                # Streaming kullanılmadığı için ilk ses, MP3 tamamen üretilip
+                # Telegram'a gönderildikten sonra kullanılabilir hale gelir.
+                metrics["ttfs_ms"] = round(
+                    (time.perf_counter() - pipeline_started) * 1000
+                )
+                metrics["e2e_ms"] = metrics["ttfs_ms"]
+                metrics["status"] = "success"
+                save_metrics()
             except Exception as tts_error:
                 print("TTS HATASI:", tts_error)
+                metrics["status"] = "partial_success"
+                metrics["failed_stage"] = current_stage
+                metrics["error_type"] = type(tts_error).__name__
+                metrics["e2e_ms"] = round(
+                    (time.perf_counter() - pipeline_started) * 1000
+                )
+                save_metrics()
         except Exception as e:
             print("SES İŞLEME HATASI:", e)
+            metrics["status"] = "error"
+            metrics["failed_stage"] = current_stage
+            metrics["error_type"] = type(e).__name__
+            metrics["e2e_ms"] = round((time.perf_counter() - pipeline_started) * 1000)
+            save_metrics()
             bot.edit_message_text(
                 chat_id=message.chat.id,
                 message_id=msg.message_id,
