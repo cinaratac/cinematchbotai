@@ -1,0 +1,18 @@
+8790113808:AAF7eyGmwkW-Q1f1O3FH4Zqobh7tBvbaI-g 
+telegram apı
+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 
+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
+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
+openrouterkey
+3GAaoKf6ZV4m6VtblCUgwLWPSed_7fWvZxeFVYece373jvfJP
+ngrok token
+
+(.venv) cinaratakul@MacBookAir telegrambot % pip install pyTelegramBotAPI requests Flask
+(.venv) cinaratakul@MacBookAir telegrambot % rm -rf .venv
+(.venv) cinaratakul@MacBookAir telegrambot % python3 -m venv .venv
+
+Başlatma adımları 
+1-terminale " source .venv/bin/activate " yaz ve sanal ortamı aktifleştir ve main.py çalıstır
+2- terminale " ngrok http 5001 " yaz sistemi kapıda bekletmeye başla
+3- http://127.0.0.1:5001/ linkine git ve kapıyı aç
+
