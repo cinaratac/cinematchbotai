@@ -280,14 +280,82 @@ if bot:
 
     @bot.message_handler(func=lambda message: True)
     def handle_all_messages(message):
+        pipeline_started = time.perf_counter()
         print("Soru geldi:", message.text)
         msg = bot.reply_to(message, "Düşünmekteyim...")
 
         username = message.from_user.username if message.from_user.username else message.from_user.first_name
+        metrics = {
+            "channel": "telegram",
+            "input_type": "text",
+            "user_id": str(message.from_user.id),
+            "username": username,
+            "session_id": None,
+            "ai_ms": None,
+            "ai_ready_ms": None,
+            "telegram_text_send_ms": None,
+            "ttfb_ms": None,
+            "ttfs_ms": None,
+            "e2e_ms": None,
+            "message_length": len(message.text or ""),
+            "answer_length": None,
+            "ai_model": MODEL_NAME,
+            "status": "started",
+            "failed_stage": None,
+            "error_type": None,
+        }
 
-        answer, _recommended_movies, _session_id = get_ai_response(message.text, user_id=message.from_user.id, username=username)
+        try:
+            ai_started = time.perf_counter()
+            answer, _recommended_movies, _session_id = get_ai_response(
+                message.text,
+                user_id=message.from_user.id,
+                username=username,
+            )
+            metrics["ai_ms"] = round((time.perf_counter() - ai_started) * 1000)
+            metrics["ai_ready_ms"] = round(
+                (time.perf_counter() - pipeline_started) * 1000
+            )
+            metrics["session_id"] = _session_id
+            metrics["answer_length"] = len(answer)
 
-        bot.edit_message_text(chat_id=message.chat.id, message_id=msg.message_id, text=answer)
+            send_started = time.perf_counter()
+            bot.edit_message_text(
+                chat_id=message.chat.id,
+                message_id=msg.message_id,
+                text=answer,
+            )
+            metrics["telegram_text_send_ms"] = round(
+                (time.perf_counter() - send_started) * 1000
+            )
+            metrics["ttfb_ms"] = round(
+                (time.perf_counter() - pipeline_started) * 1000
+            )
+            metrics["e2e_ms"] = metrics["ttfb_ms"]
+            metrics["status"] = "success"
+        except Exception as e:
+            metrics["status"] = "error"
+            metrics["failed_stage"] = (
+                "telegram_text_send" if metrics["ai_ready_ms"] is not None else "ai"
+            )
+            metrics["error_type"] = type(e).__name__
+            metrics["e2e_ms"] = round(
+                (time.perf_counter() - pipeline_started) * 1000
+            )
+            print("TELEGRAM METİN İŞLEME HATASI:", e)
+            try:
+                bot.edit_message_text(
+                    chat_id=message.chat.id,
+                    message_id=msg.message_id,
+                    text="Üzgünüm, mesajını işlerken bir sorun oluştu. Tekrar dener misin?",
+                )
+            except Exception as send_error:
+                print("TELEGRAM HATA MESAJI GÖNDERİLEMEDİ:", send_error)
+        finally:
+            try:
+                log_performance_metric(metrics)
+            except Exception as metric_error:
+                print("PERFORMANS LOG HATASI:", metric_error)
 
     @app.route('/' + TOKEN, methods=['POST'])
     def getMessage():
@@ -299,6 +367,7 @@ if bot:
 
 @app.route('/api/chat', methods=['POST'])
 def api_chat():
+    pipeline_started = time.perf_counter()
     data = request.get_json()
 
     if not data or 'message' not in data:
@@ -308,6 +377,24 @@ def api_chat():
 
     user_id = data.get('user_id', 'api_user')
     username = data.get('username', 'API_User')
+    metrics = {
+        "channel": "api",
+        "input_type": "text",
+        "user_id": str(user_id),
+        "username": username,
+        "session_id": None,
+        "ai_ms": None,
+        "ai_ready_ms": None,
+        "ttfb_ms": None,
+        "ttfs_ms": None,
+        "e2e_ms": None,
+        "message_length": len(str(user_message)),
+        "answer_length": None,
+        "ai_model": MODEL_NAME,
+        "status": "started",
+        "failed_stage": None,
+        "error_type": None,
+    }
 
     # YENİ: Cinematch uygulamasından gelen zevk profili (opsiyonel).
     # Flutter tarafı bunu her istekte gönderiyor; hiçbiri yoksa boş liste
@@ -320,6 +407,7 @@ def api_chat():
     }
 
     try:
+        ai_started = time.perf_counter()
         ai_response, recommended_movies, session_id = get_ai_response(
             user_message,
             user_id=user_id,
@@ -327,6 +415,23 @@ def api_chat():
             app_profile=app_profile,
             movie_name=data.get('movie_name') or data.get('movie_title'),
         )
+        metrics["ai_ms"] = round((time.perf_counter() - ai_started) * 1000)
+        metrics["ai_ready_ms"] = round(
+            (time.perf_counter() - pipeline_started) * 1000
+        )
+        metrics["session_id"] = session_id
+        metrics["answer_length"] = len(ai_response)
+        # Flask cevabı streaming değil; backend tarafında TTFB, JSON cevabının
+        # dönmeye hazır olduğu andır. Ağ ve istemcide render süresi dahil değildir.
+        metrics["ttfb_ms"] = round(
+            (time.perf_counter() - pipeline_started) * 1000
+        )
+        metrics["e2e_ms"] = metrics["ttfb_ms"]
+        metrics["status"] = "success"
+        try:
+            log_performance_metric(metrics)
+        except Exception as metric_error:
+            print("PERFORMANS LOG HATASI:", metric_error)
         print("LOG BAŞARILI: API isteği Firestore veritabanına kaydedildi.")
         return jsonify({
             "status": "success",
@@ -335,6 +440,16 @@ def api_chat():
             "session_id": session_id,
         }), 200
     except Exception as e:
+        metrics["status"] = "error"
+        metrics["failed_stage"] = "ai"
+        metrics["error_type"] = type(e).__name__
+        metrics["e2e_ms"] = round(
+            (time.perf_counter() - pipeline_started) * 1000
+        )
+        try:
+            log_performance_metric(metrics)
+        except Exception as metric_error:
+            print("PERFORMANS LOG HATASI:", metric_error)
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
