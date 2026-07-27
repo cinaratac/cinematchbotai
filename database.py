@@ -586,7 +586,7 @@ PERFORMANCE_METRIC_FIELDS = [
     "telegram_download_ms", "asr_ms", "ai_ms", "ai_ready_ms",
     "telegram_text_send_ms", "ttfb_ms", "tts_ms", "tts_ready_ms",
     "telegram_voice_upload_ms", "voice_audio_stream_ms", "tool_total_ms",
-    "ttfs_ms", "e2e_ms",
+    "ttfs_ms", "e2e_ms", "full_turn_ms",
 ]
 
 
@@ -681,7 +681,7 @@ def get_performance_metrics_averages(sample_size=200, session_id=None):
         e2e_ms = data.get("e2e_ms")
         voice_schema_valid = (
             data.get("channel") != "voice_websocket"
-            or data.get("metric_version") == 3
+            or data.get("metric_version") == 4
         )
         valid = (
             data.get("status") == "success"

@@ -925,7 +925,7 @@ async def voice_stream(request):
                         )
                         * 1000
                     )
-                    e2e_ms = (
+                    full_turn_ms = (
                         ttfs_ms + audio_stream_ms
                         if ttfs_ms is not None
                         else None
@@ -939,8 +939,8 @@ async def voice_stream(request):
                     metric = {
                         "channel": "voice_websocket",
                         "input_type": "streaming_audio",
-                        "metric_version": 3,
-                        "measurement_definition": "client_playback_complete",
+                        "metric_version": 4,
+                        "measurement_definition": "deepgram_e2e_first_audio",
                         "user_id": user_id,
                         "username": username,
                         "session_id": session_id,
@@ -959,7 +959,11 @@ async def voice_stream(request):
                         "tts_ready_ms": ttfs_ms,
                         "voice_audio_stream_ms": audio_stream_ms,
                         "ttfs_ms": ttfs_ms,
-                        "e2e_ms": e2e_ms,
+                        # Deepgram standardı: utterance end -> first audio byte.
+                        "e2e_ms": ttfs_ms,
+                        # İlk sesten tarayıcıdaki son oynatmaya kadar olan süre
+                        # E2E latency değil, tam sesli tur süresidir.
+                        "full_turn_ms": full_turn_ms,
                         "deepgram_ttt_token_ms": milliseconds(
                             "ttt_token_latency"
                         ),
