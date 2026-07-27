@@ -21,6 +21,15 @@ RECENT_TURNS_IN_PROMPT = 4
 _firebase_app = None
 
 
+def _storage_bucket_name():
+    return (
+        os.environ.get("FIREBASE_STORAGE_BUCKET", "")
+        .strip()
+        .removeprefix("gs://")
+        .rstrip("/")
+    )
+
+
 def _get_db():
     global _firebase_app
     if _firebase_app is None:
@@ -33,7 +42,7 @@ def _get_db():
         cred_dict = json.loads(raw_creds)
         cred = credentials.Certificate(cred_dict)
         options = {}
-        storage_bucket = os.environ.get("FIREBASE_STORAGE_BUCKET", "").strip()
+        storage_bucket = _storage_bucket_name()
         if storage_bucket:
             options["storageBucket"] = storage_bucket
         _firebase_app = firebase_admin.initialize_app(cred, options)
@@ -163,26 +172,16 @@ def save_voice_recording(
 ):
     """Bir voice bağlantısının iki WAV kanalını private Storage'a yükler."""
     _get_db()
-    bucket_name = os.environ.get("FIREBASE_STORAGE_BUCKET", "").strip()
+    bucket_name = _storage_bucket_name()
     if not bucket_name:
         raise RuntimeError(
             "FIREBASE_STORAGE_BUCKET tanımlı değil; ses kaydı yüklenemedi."
         )
 
-    bucket = storage.bucket(bucket_name)
     base_path = f"bot_voice_recordings/{session_id}/{recording_id}"
     user_storage_path = f"{base_path}/user.wav"
     agent_storage_path = f"{base_path}/agent.wav"
-
-    bucket.blob(user_storage_path).upload_from_filename(
-        user_audio_path,
-        content_type="audio/wav",
-    )
-    bucket.blob(agent_storage_path).upload_from_filename(
-        agent_audio_path,
-        content_type="audio/wav",
-    )
-
+    doc_ref = _get_db().collection(COL_VOICE_RECORDINGS).document(recording_id)
     payload = {
         "session_id": session_id,
         "user_id": str(user_id),
@@ -191,15 +190,39 @@ def save_voice_recording(
         "agent_storage_path": agent_storage_path,
         "user_duration_ms": user_duration_ms,
         "agent_duration_ms": agent_duration_ms,
+        "status": "uploading",
+        "error": None,
         "created_at": _now(),
     }
-    _get_db().collection(COL_VOICE_RECORDINGS).document(recording_id).set(payload)
+    # Önce metadata yazılır. Storage yüklemesi hata verirse koleksiyon yine
+    # görünür ve admin/log üzerinden gerçek sebep teşhis edilebilir.
+    doc_ref.set(payload)
+    try:
+        bucket = storage.bucket(bucket_name)
+        bucket.blob(user_storage_path).upload_from_filename(
+            user_audio_path,
+            content_type="audio/wav",
+        )
+        bucket.blob(agent_storage_path).upload_from_filename(
+            agent_audio_path,
+            content_type="audio/wav",
+        )
+        doc_ref.update({
+            "status": "ready",
+            "uploaded_at": _now(),
+        })
+    except Exception as exc:
+        doc_ref.update({
+            "status": "failed",
+            "error": str(exc)[:1000],
+        })
+        raise
     return recording_id
 
 
 def get_voice_recordings_admin(session_id):
     """Oturumdaki kayıtları, admin paneli için kısa ömürlü oynatma URL'leriyle döndürür."""
-    bucket_name = os.environ.get("FIREBASE_STORAGE_BUCKET", "").strip()
+    bucket_name = _storage_bucket_name()
     if not bucket_name:
         return []
 
@@ -224,18 +247,22 @@ def get_voice_recordings_admin(session_id):
             "created_at": _iso(data.get("created_at")),
             "user_duration_ms": data.get("user_duration_ms"),
             "agent_duration_ms": data.get("agent_duration_ms"),
+            "status": data.get("status"),
+            "error": data.get("error"),
         }
         for track in ("user", "agent"):
             path = data.get(f"{track}_storage_path")
-            row[f"{track}_audio_url"] = (
-                bucket.blob(path).generate_signed_url(
-                    version="v4",
-                    expiration=timedelta(minutes=15),
-                    method="GET",
-                )
-                if path
-                else None
-            )
+            row[f"{track}_audio_url"] = None
+            if path and data.get("status") == "ready":
+                try:
+                    row[f"{track}_audio_url"] = bucket.blob(path).generate_signed_url(
+                        version="v4",
+                        expiration=timedelta(minutes=15),
+                        method="GET",
+                    )
+                except Exception as exc:
+                    row["status"] = "url_error"
+                    row["error"] = str(exc)[:1000]
         result.append(row)
     return result
 

@@ -860,7 +860,19 @@ async def voice_stream(request):
             not in {"0", "false", "no"}
             and bool(os.environ.get("FIREBASE_STORAGE_BUCKET", "").strip())
         )
+        if (
+            os.environ.get("VOICE_RECORDING_ENABLED", "true").lower()
+            not in {"0", "false", "no"}
+            and not os.environ.get("FIREBASE_STORAGE_BUCKET", "").strip()
+        ):
+            print(
+                "VOICE KAYIT UYARISI: FIREBASE_STORAGE_BUCKET tanımlı değil; "
+                "bu görüşme kaydedilmeyecek."
+            )
         if recording_enabled:
+            print(
+                "Voice kaydı başlatıldı; Firebase Storage bucket hazır.",
+            )
             recording_id = uuid.uuid4().hex
             for track, sample_rate in (("user", input_sample_rate), ("agent", 24000)):
                 temp_file = tempfile.NamedTemporaryFile(
