@@ -3,6 +3,9 @@ import json
 import re
 import time
 import os
+import tempfile
+import uuid
+import wave
 import aiohttp
 from fractions import Fraction
 from aiohttp import web
@@ -23,6 +26,7 @@ from database import (
     get_session_transcript_recent,
     log_chat,
     log_performance_metric,
+    save_voice_recording,
     touch_session,
 )
 
@@ -805,6 +809,10 @@ async def voice_stream(request):
 
     ws = web.WebSocketResponse(heartbeat=20, max_msg_size=15 * 1024 * 1024)
     await ws.prepare(request)
+    recording_writers = {}
+    recording_paths = {}
+    recording_bytes = {"user": 0, "agent": 0}
+    recording_context = None
 
     try:
         auth_message = await asyncio.wait_for(ws.receive(), timeout=10)
@@ -846,6 +854,34 @@ async def voice_stream(request):
             input_sample_rate = 48000
         if input_sample_rate < 8000 or input_sample_rate > 48000:
             input_sample_rate = 48000
+
+        recording_enabled = (
+            os.environ.get("VOICE_RECORDING_ENABLED", "true").lower()
+            not in {"0", "false", "no"}
+            and bool(os.environ.get("FIREBASE_STORAGE_BUCKET", "").strip())
+        )
+        if recording_enabled:
+            recording_id = uuid.uuid4().hex
+            for track, sample_rate in (("user", input_sample_rate), ("agent", 24000)):
+                temp_file = tempfile.NamedTemporaryFile(
+                    prefix=f"cinematch-{track}-",
+                    suffix=".wav",
+                    delete=False,
+                )
+                temp_file.close()
+                writer = wave.open(temp_file.name, "wb")
+                writer.setnchannels(1)
+                writer.setsampwidth(2)
+                writer.setframerate(sample_rate)
+                recording_paths[track] = temp_file.name
+                recording_writers[track] = writer
+            recording_context = {
+                "recording_id": recording_id,
+                "session_id": session_id,
+                "user_id": user_id,
+                "username": username,
+                "input_sample_rate": input_sample_rate,
+            }
 
         settings = _streaming_agent_settings(
             app_profile, history, input_sample_rate
@@ -1017,6 +1053,9 @@ async def voice_stream(request):
                         if message.type == aiohttp.WSMsgType.BINARY:
                             if message.data:
                                 await settings_applied.wait()
+                                if "user" in recording_writers:
+                                    recording_writers["user"].writeframesraw(message.data)
+                                    recording_bytes["user"] += len(message.data)
                                 await agent_ws.send_bytes(message.data)
                         elif message.type == aiohttp.WSMsgType.TEXT:
                             try:
@@ -1061,6 +1100,9 @@ async def voice_stream(request):
                             if not drop_interrupted_audio:
                                 if first_audio_at is None:
                                     first_audio_at = time.perf_counter()
+                                if "agent" in recording_writers:
+                                    recording_writers["agent"].writeframesraw(message.data)
+                                    recording_bytes["agent"] += len(message.data)
                                 await ws.send_bytes(message.data)
                             continue
                         if message.type != aiohttp.WSMsgType.TEXT:
@@ -1208,6 +1250,46 @@ async def voice_stream(request):
                 "type": "error",
                 "message": str(exc) or "Voice streaming hatası.",
             })
+    finally:
+        for writer in recording_writers.values():
+            try:
+                writer.close()
+            except Exception:
+                pass
+
+        if recording_context and recording_bytes["user"] > 0:
+            try:
+                user_duration_ms = round(
+                    recording_bytes["user"]
+                    / (recording_context["input_sample_rate"] * 2)
+                    * 1000
+                )
+                agent_duration_ms = round(
+                    recording_bytes["agent"] / (24000 * 2) * 1000
+                )
+                await asyncio.to_thread(
+                    save_voice_recording,
+                    recording_context["session_id"],
+                    recording_context["user_id"],
+                    recording_context["username"],
+                    recording_context["recording_id"],
+                    recording_paths["user"],
+                    recording_paths["agent"],
+                    user_duration_ms,
+                    agent_duration_ms,
+                )
+                print(
+                    "Voice kaydı Firebase Storage'a yüklendi:",
+                    recording_context["recording_id"],
+                )
+            except Exception as recording_error:
+                print("Voice kayıt yükleme hatası:", repr(recording_error))
+
+        for path in recording_paths.values():
+            try:
+                os.unlink(path)
+            except (FileNotFoundError, OSError):
+                pass
 
     return ws
 

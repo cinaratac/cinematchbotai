@@ -4,7 +4,7 @@ import time
 from datetime import datetime, timedelta, timezone
 
 import firebase_admin
-from firebase_admin import credentials, firestore
+from firebase_admin import credentials, firestore, storage
 from google.cloud.firestore_v1 import FieldFilter
 
 # Oturum süresi
@@ -32,7 +32,11 @@ def _get_db():
             )
         cred_dict = json.loads(raw_creds)
         cred = credentials.Certificate(cred_dict)
-        _firebase_app = firebase_admin.initialize_app(cred)
+        options = {}
+        storage_bucket = os.environ.get("FIREBASE_STORAGE_BUCKET", "").strip()
+        if storage_bucket:
+            options["storageBucket"] = storage_bucket
+        _firebase_app = firebase_admin.initialize_app(cred, options)
     return firestore.client()
 
 
@@ -44,6 +48,7 @@ COL_USER_PROFILE = "bot_user_profiles"
 COL_API_LOGS = "bot_api_logs"
 COL_EVALUATIONS = "bot_evaluations"
 COL_PERFORMANCE_METRICS = "bot_performance_metrics"
+COL_VOICE_RECORDINGS = "bot_voice_recordings"
 
 
 def _now():
@@ -144,6 +149,95 @@ def log_chat(session_id, user_id, username, user_message, bot_response):
         "created_at": _now(),
     })
     print("LOG BAŞARILI: Mesaj Firestore'a kaydedildi.")
+
+
+def save_voice_recording(
+    session_id,
+    user_id,
+    username,
+    recording_id,
+    user_audio_path,
+    agent_audio_path,
+    user_duration_ms,
+    agent_duration_ms,
+):
+    """Bir voice bağlantısının iki WAV kanalını private Storage'a yükler."""
+    _get_db()
+    bucket_name = os.environ.get("FIREBASE_STORAGE_BUCKET", "").strip()
+    if not bucket_name:
+        raise RuntimeError(
+            "FIREBASE_STORAGE_BUCKET tanımlı değil; ses kaydı yüklenemedi."
+        )
+
+    bucket = storage.bucket(bucket_name)
+    base_path = f"bot_voice_recordings/{session_id}/{recording_id}"
+    user_storage_path = f"{base_path}/user.wav"
+    agent_storage_path = f"{base_path}/agent.wav"
+
+    bucket.blob(user_storage_path).upload_from_filename(
+        user_audio_path,
+        content_type="audio/wav",
+    )
+    bucket.blob(agent_storage_path).upload_from_filename(
+        agent_audio_path,
+        content_type="audio/wav",
+    )
+
+    payload = {
+        "session_id": session_id,
+        "user_id": str(user_id),
+        "username": username,
+        "user_storage_path": user_storage_path,
+        "agent_storage_path": agent_storage_path,
+        "user_duration_ms": user_duration_ms,
+        "agent_duration_ms": agent_duration_ms,
+        "created_at": _now(),
+    }
+    _get_db().collection(COL_VOICE_RECORDINGS).document(recording_id).set(payload)
+    return recording_id
+
+
+def get_voice_recordings_admin(session_id):
+    """Oturumdaki kayıtları, admin paneli için kısa ömürlü oynatma URL'leriyle döndürür."""
+    bucket_name = os.environ.get("FIREBASE_STORAGE_BUCKET", "").strip()
+    if not bucket_name:
+        return []
+
+    docs = list(
+        _get_db().collection(COL_VOICE_RECORDINGS)
+        .where(filter=FieldFilter("session_id", "==", session_id))
+        .stream()
+    )
+    docs.sort(
+        key=lambda d: (
+            d.to_dict().get("created_at").timestamp()
+            if isinstance(d.to_dict().get("created_at"), datetime)
+            else 0
+        )
+    )
+    bucket = storage.bucket(bucket_name)
+    result = []
+    for doc in docs:
+        data = doc.to_dict()
+        row = {
+            "id": doc.id,
+            "created_at": _iso(data.get("created_at")),
+            "user_duration_ms": data.get("user_duration_ms"),
+            "agent_duration_ms": data.get("agent_duration_ms"),
+        }
+        for track in ("user", "agent"):
+            path = data.get(f"{track}_storage_path")
+            row[f"{track}_audio_url"] = (
+                bucket.blob(path).generate_signed_url(
+                    version="v4",
+                    expiration=timedelta(minutes=15),
+                    method="GET",
+                )
+                if path
+                else None
+            )
+        result.append(row)
+    return result
 
 
 def get_session_transcript(session_id, limit=50):
@@ -526,6 +620,7 @@ def get_session_admin_detail(session_id):
         sample_size=200,
         session_id=session_id,
     )
+    voice_recordings = get_voice_recordings_admin(session_id)
 
     return {
         "session": session,
@@ -535,6 +630,7 @@ def get_session_admin_detail(session_id):
         "user_facts": user_facts,
         "performance_metrics": performance_metrics,
         "performance_averages": performance_averages,
+        "voice_recordings": voice_recordings,
     }
 
 
