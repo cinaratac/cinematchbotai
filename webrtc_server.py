@@ -866,6 +866,15 @@ async def voice_stream(request):
                 deepgram_request_id = None
                 turn_number = 0
                 client_interrupt_started = None
+                latency_logged_for_turn = False
+
+                def track_persistence_task(task):
+                    persistence_tasks.discard(task)
+                    if task.cancelled():
+                        return
+                    error = task.exception()
+                    if error:
+                        print("Voice metrik/veritabanı kayıt hatası:", repr(error))
 
                 async def persist_turn(user_text, assistant_text):
                     await asyncio.to_thread(
@@ -891,8 +900,14 @@ async def voice_stream(request):
                     ai_ms = milliseconds("ttt_text_latency")
                     if ai_ms is None:
                         ai_ms = milliseconds("ttt_token_latency")
+                    if ai_ms is None:
+                        ai_ms = milliseconds("ttt_latency")
                     tts_ms = milliseconds("tts_latency")
                     e2e_ms = milliseconds("total_latency")
+                    if ai_ms is None and e2e_ms is not None:
+                        # Bazı sağlayıcı/turlarda yalnızca total + TTS gelir.
+                        # Belge admin başarı kohortundan düşmesin.
+                        ai_ms = max(0, e2e_ms - (tts_ms or 0))
                     asr_ms = None
                     if e2e_ms is not None and ai_ms is not None and tts_ms is not None:
                         # Deepgram ayrı STT alanı vermiyor. Total = utterance
@@ -979,6 +994,7 @@ async def voice_stream(request):
                     nonlocal interrupted_user_committed
                     nonlocal deepgram_request_id
                     nonlocal client_interrupt_started
+                    nonlocal latency_logged_for_turn
                     async for message in agent_ws:
                         if message.type == aiohttp.WSMsgType.BINARY:
                             if not drop_interrupted_audio:
@@ -1043,15 +1059,28 @@ async def voice_stream(request):
                                 )
                                 persistence_tasks.add(persistence_task)
                                 persistence_task.add_done_callback(
-                                    persistence_tasks.discard
+                                    track_persistence_task
                                 )
                         elif event_type == "UserStartedSpeaking":
+                            latency_logged_for_turn = False
                             drop_interrupted_audio = True
                             interrupted_user_committed = bool(pending_user_text)
                             await ws.send_json({"type": "interrupt"})
                         elif event_type == "AgentThinking":
                             await ws.send_json({"type": "processing"})
                         elif event_type == "AgentStartedSpeaking":
+                            if (
+                                not latency_logged_for_turn
+                                and isinstance(event.get("total_latency"), (int, float))
+                            ):
+                                latency_task = asyncio.create_task(
+                                    persist_latency(event)
+                                )
+                                persistence_tasks.add(latency_task)
+                                latency_task.add_done_callback(
+                                    track_persistence_task
+                                )
+                                latency_logged_for_turn = True
                             if drop_interrupted_audio and not interrupted_user_committed:
                                 continue
                             client_interrupt_started = None
@@ -1066,8 +1095,9 @@ async def voice_stream(request):
                             )
                             persistence_tasks.add(latency_task)
                             latency_task.add_done_callback(
-                                persistence_tasks.discard
+                                track_persistence_task
                             )
+                            latency_logged_for_turn = True
                         elif event_type in {"Warning", "Error"}:
                             await ws.send_json({
                                 "type": event_type.lower(),
