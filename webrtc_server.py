@@ -1,8 +1,10 @@
 import asyncio
+import io
 import json
 import re
 import time
 import os
+import wave
 import aiohttp
 from fractions import Fraction
 from aiohttp import web
@@ -16,8 +18,14 @@ from aiortc import (
 )
 from av import AudioFrame
 from av.audio.resampler import AudioResampler
-from ai_service import get_ai_response, text_to_speech, transcribe_audio
+from ai_service import get_ai_response, text_to_speech
 from app_guide import CINEMATCH_APP_GUIDE
+from database import (
+    get_or_create_session,
+    get_session_transcript_recent,
+    log_chat,
+    touch_session,
+)
 
 # Ortam değişkenlerinden Deepgram anahtarını alıyoruz
 DEEPGRAM_API_KEY = os.environ.get("DEEPGRAM_API_KEY")
@@ -716,8 +724,138 @@ async def options_handler(request):
     return web.Response(status=204, headers=headers)
 
 
+async def _deepgram_transcribe(audio_bytes, audio_format):
+    content_types = {
+        "webm": "audio/webm",
+        "ogg": "audio/ogg",
+        "m4a": "audio/mp4",
+        "mp4": "audio/mp4",
+    }
+    url = (
+        "https://api.deepgram.com/v1/listen"
+        "?model=nova-3&language=tr&smart_format=true"
+    )
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            url,
+            headers={
+                "Authorization": f"Token {DEEPGRAM_API_KEY}",
+                "Content-Type": content_types.get(audio_format, "audio/webm"),
+            },
+            data=audio_bytes,
+            timeout=aiohttp.ClientTimeout(total=60),
+        ) as response:
+            data = await response.json()
+            if response.status >= 400:
+                raise RuntimeError(
+                    data.get("err_msg")
+                    or data.get("message")
+                    or f"Deepgram STT HTTP {response.status}"
+                )
+    try:
+        transcript = data["results"]["channels"][0]["alternatives"][0]["transcript"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise RuntimeError("Deepgram geçerli bir transkript döndürmedi.") from exc
+    if not transcript.strip():
+        raise RuntimeError("Konuşma anlaşılamadı.")
+    return transcript.strip()
+
+
+def _pcm_to_wav(pcm):
+    output = io.BytesIO()
+    with wave.open(output, "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(24000)
+        wav_file.writeframes(pcm)
+    return output.getvalue()
+
+
+async def _deepgram_agent_text_response(transcript, prompt):
+    settings = {
+        "type": "Settings",
+        "audio": {
+            "input": {"encoding": "linear16", "sample_rate": 16000},
+            "output": {
+                "encoding": "linear16",
+                "sample_rate": 24000,
+                "container": "none",
+            },
+        },
+        "agent": {
+            "language": "tr",
+            "listen": {
+                "provider": {
+                    "type": "deepgram",
+                    "model": "nova-3",
+                    "language": "tr",
+                }
+            },
+            "think": {
+                "provider": {
+                    "type": "google",
+                    "model": "gemini-3.1-flash-lite",
+                    "temperature": 0.2,
+                },
+                "prompt": prompt,
+            },
+            "speak": {
+                "provider": {
+                    "type": "cartesia",
+                    "model_id": "sonic-3",
+                    "voice": {
+                        "mode": "id",
+                        "id": "a167e0f3-df7e-4d52-a9c3-f949145efdab",
+                    },
+                    "language": "tr",
+                    "speed": "normal",
+                }
+            },
+        },
+    }
+    audio = bytearray()
+    assistant_parts = []
+    async with aiohttp.ClientSession() as session:
+        async with session.ws_connect(
+            "wss://agent.deepgram.com/v1/agent/converse",
+            headers={"Authorization": f"Token {DEEPGRAM_API_KEY}"},
+            heartbeat=20,
+        ) as agent_ws:
+            async with asyncio.timeout(75):
+                async for message in agent_ws:
+                    if message.type == aiohttp.WSMsgType.BINARY:
+                        audio.extend(message.data)
+                        continue
+                    if message.type != aiohttp.WSMsgType.TEXT:
+                        continue
+                    event = json.loads(message.data)
+                    event_type = event.get("type")
+                    if event_type == "Welcome":
+                        await agent_ws.send_json(settings)
+                    elif event_type == "SettingsApplied":
+                        await agent_ws.send_json({
+                            "type": "InjectUserMessage",
+                            "content": transcript,
+                        })
+                    elif event_type == "ConversationText":
+                        if event.get("role") == "assistant" and event.get("content"):
+                            assistant_parts.append(event["content"].strip())
+                    elif event_type == "AgentAudioDone":
+                        break
+                    elif event_type == "Error":
+                        raise RuntimeError(
+                            event.get("description") or "Deepgram Voice Agent hatası."
+                        )
+    answer = " ".join(dict.fromkeys(part for part in assistant_parts if part)).strip()
+    if not answer:
+        raise RuntimeError("Deepgram Voice Agent metin cevap döndürmedi.")
+    if not audio:
+        raise RuntimeError("Deepgram Voice Agent ses cevap döndürmedi.")
+    return answer, _pcm_to_wav(bytes(audio))
+
+
 async def voice_stream(request):
-    """TURN gerektirmeyen, ai_service tabanlı sesli sohbet WebSocket'i."""
+    """TURN ve OpenRouter gerektirmeyen Deepgram sesli sohbet WebSocket'i."""
     cors_headers = _cors_headers(request)
     if request.headers.get("Origin") and "Access-Control-Allow-Origin" not in cors_headers:
         return web.json_response(
@@ -757,6 +895,9 @@ async def voice_stream(request):
             "favorite_actors": context.get("favorite_actors") or [],
             "favorite_movies": context.get("favorite_movies") or [],
         }
+        session_id = await asyncio.to_thread(
+            get_or_create_session, user_id, username
+        )
         audio_format = "webm"
         await ws.send_json({"type": "ready"})
 
@@ -784,27 +925,42 @@ async def voice_stream(request):
 
             await ws.send_json({"type": "processing"})
             try:
-                transcript = await asyncio.to_thread(
-                    transcribe_audio,
-                    bytes(message.data),
-                    audio_format=audio_format,
-                    language="tr",
+                transcript = await _deepgram_transcribe(
+                    bytes(message.data), audio_format
                 )
-                answer, movies, session_id = await asyncio.to_thread(
-                    get_ai_response,
+                history = await asyncio.to_thread(
+                    get_session_transcript_recent, session_id, 6
+                )
+                history_text = "\n".join(
+                    f"Kullanıcı: {row.get('user_message', '')}\n"
+                    f"Asistan: {row.get('bot_response', '')}"
+                    for row in history
+                )
+                profile_text = json.dumps(app_profile, ensure_ascii=False)
+                prompt = (
+                    f"{VOICE_AGENT_PROMPT}\n\n"
+                    f"KULLANICI ZEVK PROFİLİ: {profile_text}\n\n"
+                    f"SON KONUŞMALAR:\n{history_text or 'Henüz yok.'}"
+                )
+                answer, speech = await _deepgram_agent_text_response(
+                    transcript, prompt
+                )
+                await asyncio.to_thread(
+                    log_chat,
+                    session_id,
+                    user_id,
+                    username,
                     transcript,
-                    user_id=user_id,
-                    username=username,
-                    app_profile=app_profile,
+                    answer,
                 )
-                speech = await asyncio.to_thread(text_to_speech, answer)
+                await asyncio.to_thread(touch_session, session_id)
                 await ws.send_json({
                     "type": "response",
                     "transcript": transcript,
                     "answer": answer,
-                    "recommended_movies": movies,
+                    "recommended_movies": [],
                     "session_id": session_id,
-                    "audio_format": "mp3",
+                    "audio_format": "wav",
                 })
                 await ws.send_bytes(speech)
             except Exception as exc:
