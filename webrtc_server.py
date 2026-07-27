@@ -22,6 +22,7 @@ from database import (
     get_or_create_session,
     get_session_transcript_recent,
     log_chat,
+    log_performance_metric,
     touch_session,
 )
 
@@ -860,6 +861,11 @@ async def voice_stream(request):
                 pending_user_text = None
                 settings_applied = asyncio.Event()
                 persistence_tasks = set()
+                drop_interrupted_audio = False
+                interrupted_user_committed = False
+                deepgram_request_id = None
+                turn_number = 0
+                client_interrupt_started = None
 
                 async def persist_turn(user_text, assistant_text):
                     await asyncio.to_thread(
@@ -872,7 +878,75 @@ async def voice_stream(request):
                     )
                     await asyncio.to_thread(touch_session, session_id)
 
+                async def persist_latency(event):
+                    nonlocal turn_number
+                    turn_number += 1
+
+                    def milliseconds(field):
+                        value = event.get(field)
+                        if isinstance(value, (int, float)):
+                            return round(value * 1000)
+                        return None
+
+                    ai_ms = milliseconds("ttt_text_latency")
+                    if ai_ms is None:
+                        ai_ms = milliseconds("ttt_token_latency")
+                    tts_ms = milliseconds("tts_latency")
+                    e2e_ms = milliseconds("total_latency")
+                    asr_ms = None
+                    if e2e_ms is not None and ai_ms is not None and tts_ms is not None:
+                        # Deepgram ayrı STT alanı vermiyor. Total = utterance
+                        # sonu → ilk ses olduğundan kalan süre STT finalizasyonu
+                        # ve Agent yönlendirme ek yükünün yaklaşık değeridir.
+                        asr_ms = max(0, e2e_ms - ai_ms - tts_ms)
+
+                    metric = {
+                        "channel": "voice_websocket",
+                        "input_type": "streaming_audio",
+                        "user_id": user_id,
+                        "username": username,
+                        "session_id": session_id,
+                        "deepgram_request_id": deepgram_request_id,
+                        "turn_number": turn_number,
+                        "asr_ms": asr_ms,
+                        "asr_is_estimate": True,
+                        "ai_ms": ai_ms,
+                        "ai_ready_ms": (
+                            e2e_ms - tts_ms
+                            if e2e_ms is not None and tts_ms is not None
+                            else None
+                        ),
+                        "ttfb_ms": ai_ms,
+                        "tts_ms": tts_ms,
+                        "tts_ready_ms": e2e_ms,
+                        "ttfs_ms": e2e_ms,
+                        "e2e_ms": e2e_ms,
+                        "deepgram_ttt_token_ms": milliseconds(
+                            "ttt_token_latency"
+                        ),
+                        "deepgram_ttt_text_ms": milliseconds(
+                            "ttt_text_latency"
+                        ),
+                        "deepgram_ttt_tool_ms": milliseconds(
+                            "ttt_tool_latency"
+                        ),
+                        "deepgram_ttt_thinking_ms": milliseconds(
+                            "ttt_thinking_latency"
+                        ),
+                        "asr_model": "deepgram/nova-3",
+                        "ai_model": "google/gemini-3.1-flash-lite",
+                        "tts_model": "cartesia/sonic-3",
+                        "tool_call_count": 0,
+                        "status": "success",
+                        "failed_stage": None,
+                        "error_type": None,
+                    }
+                    await asyncio.to_thread(log_performance_metric, metric)
+
                 async def browser_to_agent():
+                    nonlocal drop_interrupted_audio
+                    nonlocal interrupted_user_committed
+                    nonlocal client_interrupt_started
                     async for message in ws:
                         if message.type == aiohttp.WSMsgType.BINARY:
                             if message.data:
@@ -885,6 +959,13 @@ async def voice_stream(request):
                                 continue
                             if command.get("type") == "keepalive":
                                 await agent_ws.send_json({"type": "KeepAlive"})
+                            elif command.get("type") == "interrupt":
+                                drop_interrupted_audio = True
+                                interrupted_user_committed = False
+                                client_interrupt_started = time.perf_counter()
+                                await ws.send_json({
+                                    "type": "interrupt_acknowledged"
+                                })
                         elif message.type in {
                             aiohttp.WSMsgType.CLOSE,
                             aiohttp.WSMsgType.CLOSED,
@@ -894,9 +975,14 @@ async def voice_stream(request):
 
                 async def agent_to_browser():
                     nonlocal pending_user_text
+                    nonlocal drop_interrupted_audio
+                    nonlocal interrupted_user_committed
+                    nonlocal deepgram_request_id
+                    nonlocal client_interrupt_started
                     async for message in agent_ws:
                         if message.type == aiohttp.WSMsgType.BINARY:
-                            await ws.send_bytes(message.data)
+                            if not drop_interrupted_audio:
+                                await ws.send_bytes(message.data)
                             continue
                         if message.type != aiohttp.WSMsgType.TEXT:
                             continue
@@ -904,6 +990,7 @@ async def voice_stream(request):
                         event = json.loads(message.data)
                         event_type = event.get("type")
                         if event_type == "Welcome":
+                            deepgram_request_id = event.get("request_id")
                             await agent_ws.send_json(settings)
                         elif event_type == "SettingsApplied":
                             settings_applied.set()
@@ -918,6 +1005,14 @@ async def voice_stream(request):
                             content = str(event.get("content") or "").strip()
                             if not content:
                                 continue
+                            if (
+                                role == "assistant"
+                                and drop_interrupted_audio
+                                and not interrupted_user_committed
+                            ):
+                                # Kesilmiş cevabın geç ulaşan metnini istemciye
+                                # gönderme ve yeni turun parçası gibi kaydetme.
+                                continue
                             await ws.send_json({
                                 "type": "transcript",
                                 "role": role,
@@ -925,6 +1020,8 @@ async def voice_stream(request):
                             })
                             if role == "user":
                                 pending_user_text = content
+                                if drop_interrupted_audio:
+                                    interrupted_user_committed = True
                             elif role == "assistant" and pending_user_text:
                                 user_text = pending_user_text
                                 pending_user_text = None
@@ -936,13 +1033,28 @@ async def voice_stream(request):
                                     persistence_tasks.discard
                                 )
                         elif event_type == "UserStartedSpeaking":
+                            drop_interrupted_audio = True
+                            interrupted_user_committed = bool(pending_user_text)
                             await ws.send_json({"type": "interrupt"})
                         elif event_type == "AgentThinking":
                             await ws.send_json({"type": "processing"})
                         elif event_type == "AgentStartedSpeaking":
+                            if drop_interrupted_audio and not interrupted_user_committed:
+                                continue
+                            client_interrupt_started = None
+                            drop_interrupted_audio = False
+                            interrupted_user_committed = False
                             await ws.send_json({"type": "speaking"})
                         elif event_type == "AgentAudioDone":
                             await ws.send_json({"type": "audio_done"})
+                        elif event_type == "LatencyReport":
+                            latency_task = asyncio.create_task(
+                                persist_latency(event)
+                            )
+                            persistence_tasks.add(latency_task)
+                            latency_task.add_done_callback(
+                                persistence_tasks.discard
+                            )
                         elif event_type in {"Warning", "Error"}:
                             await ws.send_json({
                                 "type": event_type.lower(),
