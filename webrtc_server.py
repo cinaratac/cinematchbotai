@@ -1,10 +1,8 @@
 import asyncio
-import io
 import json
 import re
 import time
 import os
-import wave
 import aiohttp
 from fractions import Fraction
 from aiohttp import web
@@ -724,58 +722,36 @@ async def options_handler(request):
     return web.Response(status=204, headers=headers)
 
 
-async def _deepgram_transcribe(audio_bytes, audio_format):
-    content_types = {
-        "webm": "audio/webm",
-        "ogg": "audio/ogg",
-        "m4a": "audio/mp4",
-        "mp4": "audio/mp4",
-    }
-    url = (
-        "https://api.deepgram.com/v1/listen"
-        "?model=nova-3&language=tr&smart_format=true"
+def _streaming_agent_settings(app_profile, history, input_sample_rate):
+    history_messages = []
+    for row in history:
+        if row.get("user_message"):
+            history_messages.append({
+                "type": "History",
+                "role": "user",
+                "content": row["user_message"],
+            })
+        if row.get("bot_response"):
+            history_messages.append({
+                "type": "History",
+                "role": "assistant",
+                "content": row["bot_response"],
+            })
+
+    profile_text = json.dumps(app_profile, ensure_ascii=False)
+    prompt = (
+        f"{VOICE_AGENT_PROMPT}\n\n"
+        f"KULLANICI ZEVK PROFİLİ: {profile_text}\n"
+        "Bu tercihleri film önerilerinde doğal biçimde dikkate al."
     )
-    async with aiohttp.ClientSession() as session:
-        async with session.post(
-            url,
-            headers={
-                "Authorization": f"Token {DEEPGRAM_API_KEY}",
-                "Content-Type": content_types.get(audio_format, "audio/webm"),
-            },
-            data=audio_bytes,
-            timeout=aiohttp.ClientTimeout(total=60),
-        ) as response:
-            data = await response.json()
-            if response.status >= 400:
-                raise RuntimeError(
-                    data.get("err_msg")
-                    or data.get("message")
-                    or f"Deepgram STT HTTP {response.status}"
-                )
-    try:
-        transcript = data["results"]["channels"][0]["alternatives"][0]["transcript"]
-    except (KeyError, IndexError, TypeError) as exc:
-        raise RuntimeError("Deepgram geçerli bir transkript döndürmedi.") from exc
-    if not transcript.strip():
-        raise RuntimeError("Konuşma anlaşılamadı.")
-    return transcript.strip()
-
-
-def _pcm_to_wav(pcm):
-    output = io.BytesIO()
-    with wave.open(output, "wb") as wav_file:
-        wav_file.setnchannels(1)
-        wav_file.setsampwidth(2)
-        wav_file.setframerate(24000)
-        wav_file.writeframes(pcm)
-    return output.getvalue()
-
-
-async def _deepgram_agent_text_response(transcript, prompt):
-    settings = {
+    return {
         "type": "Settings",
+        "tags": ["cinematch", "websocket-streaming"],
         "audio": {
-            "input": {"encoding": "linear16", "sample_rate": 16000},
+            "input": {
+                "encoding": "linear16",
+                "sample_rate": input_sample_rate,
+            },
             "output": {
                 "encoding": "linear16",
                 "sample_rate": 24000,
@@ -784,6 +760,7 @@ async def _deepgram_agent_text_response(transcript, prompt):
         },
         "agent": {
             "language": "tr",
+            "context": {"messages": history_messages},
             "listen": {
                 "provider": {
                     "type": "deepgram",
@@ -813,49 +790,10 @@ async def _deepgram_agent_text_response(transcript, prompt):
             },
         },
     }
-    audio = bytearray()
-    assistant_parts = []
-    async with aiohttp.ClientSession() as session:
-        async with session.ws_connect(
-            "wss://agent.deepgram.com/v1/agent/converse",
-            headers={"Authorization": f"Token {DEEPGRAM_API_KEY}"},
-            heartbeat=20,
-        ) as agent_ws:
-            async with asyncio.timeout(75):
-                async for message in agent_ws:
-                    if message.type == aiohttp.WSMsgType.BINARY:
-                        audio.extend(message.data)
-                        continue
-                    if message.type != aiohttp.WSMsgType.TEXT:
-                        continue
-                    event = json.loads(message.data)
-                    event_type = event.get("type")
-                    if event_type == "Welcome":
-                        await agent_ws.send_json(settings)
-                    elif event_type == "SettingsApplied":
-                        await agent_ws.send_json({
-                            "type": "InjectUserMessage",
-                            "content": transcript,
-                        })
-                    elif event_type == "ConversationText":
-                        if event.get("role") == "assistant" and event.get("content"):
-                            assistant_parts.append(event["content"].strip())
-                    elif event_type == "AgentAudioDone":
-                        break
-                    elif event_type == "Error":
-                        raise RuntimeError(
-                            event.get("description") or "Deepgram Voice Agent hatası."
-                        )
-    answer = " ".join(dict.fromkeys(part for part in assistant_parts if part)).strip()
-    if not answer:
-        raise RuntimeError("Deepgram Voice Agent metin cevap döndürmedi.")
-    if not audio:
-        raise RuntimeError("Deepgram Voice Agent ses cevap döndürmedi.")
-    return answer, _pcm_to_wav(bytes(audio))
 
 
 async def voice_stream(request):
-    """TURN ve OpenRouter gerektirmeyen Deepgram sesli sohbet WebSocket'i."""
+    """Tarayıcı ile Deepgram arasında düşük gecikmeli PCM WebSocket köprüsü."""
     cors_headers = _cors_headers(request)
     if request.headers.get("Origin") and "Access-Control-Allow-Origin" not in cors_headers:
         return web.json_response(
@@ -898,81 +836,150 @@ async def voice_stream(request):
         session_id = await asyncio.to_thread(
             get_or_create_session, user_id, username
         )
-        audio_format = "webm"
-        await ws.send_json({"type": "ready"})
+        history = await asyncio.to_thread(
+            get_session_transcript_recent, session_id, 6
+        )
+        try:
+            input_sample_rate = int(context.get("sample_rate") or 48000)
+        except (TypeError, ValueError):
+            input_sample_rate = 48000
+        if input_sample_rate < 8000 or input_sample_rate > 48000:
+            input_sample_rate = 48000
 
-        async for message in ws:
-            if message.type == aiohttp.WSMsgType.TEXT:
-                try:
-                    command = json.loads(message.data)
-                except json.JSONDecodeError:
-                    continue
-                if command.get("type") == "utterance":
-                    audio_format = str(command.get("format") or "webm")[:12]
-                continue
+        settings = _streaming_agent_settings(
+            app_profile, history, input_sample_rate
+        )
+        await ws.send_json({"type": "connecting"})
 
-            if message.type != aiohttp.WSMsgType.BINARY:
-                if message.type in {
-                    aiohttp.WSMsgType.CLOSE,
-                    aiohttp.WSMsgType.CLOSED,
-                    aiohttp.WSMsgType.ERROR,
-                }:
-                    break
-                continue
+        async with aiohttp.ClientSession() as session:
+            async with session.ws_connect(
+                "wss://agent.deepgram.com/v1/agent/converse",
+                headers={"Authorization": f"Token {DEEPGRAM_API_KEY}"},
+                heartbeat=20,
+            ) as agent_ws:
+                pending_user_text = None
+                settings_applied = asyncio.Event()
+                persistence_tasks = set()
 
-            if not message.data:
-                continue
+                async def persist_turn(user_text, assistant_text):
+                    await asyncio.to_thread(
+                        log_chat,
+                        session_id,
+                        user_id,
+                        username,
+                        user_text,
+                        assistant_text,
+                    )
+                    await asyncio.to_thread(touch_session, session_id)
 
-            await ws.send_json({"type": "processing"})
-            try:
-                transcript = await _deepgram_transcribe(
-                    bytes(message.data), audio_format
+                async def browser_to_agent():
+                    async for message in ws:
+                        if message.type == aiohttp.WSMsgType.BINARY:
+                            if message.data:
+                                await settings_applied.wait()
+                                await agent_ws.send_bytes(message.data)
+                        elif message.type == aiohttp.WSMsgType.TEXT:
+                            try:
+                                command = json.loads(message.data)
+                            except json.JSONDecodeError:
+                                continue
+                            if command.get("type") == "keepalive":
+                                await agent_ws.send_json({"type": "KeepAlive"})
+                        elif message.type in {
+                            aiohttp.WSMsgType.CLOSE,
+                            aiohttp.WSMsgType.CLOSED,
+                            aiohttp.WSMsgType.ERROR,
+                        }:
+                            break
+
+                async def agent_to_browser():
+                    nonlocal pending_user_text
+                    async for message in agent_ws:
+                        if message.type == aiohttp.WSMsgType.BINARY:
+                            await ws.send_bytes(message.data)
+                            continue
+                        if message.type != aiohttp.WSMsgType.TEXT:
+                            continue
+
+                        event = json.loads(message.data)
+                        event_type = event.get("type")
+                        if event_type == "Welcome":
+                            await agent_ws.send_json(settings)
+                        elif event_type == "SettingsApplied":
+                            settings_applied.set()
+                            await ws.send_json({
+                                "type": "ready",
+                                "session_id": session_id,
+                                "input_sample_rate": input_sample_rate,
+                                "output_sample_rate": 24000,
+                            })
+                        elif event_type == "ConversationText":
+                            role = event.get("role")
+                            content = str(event.get("content") or "").strip()
+                            if not content:
+                                continue
+                            await ws.send_json({
+                                "type": "transcript",
+                                "role": role,
+                                "content": content,
+                            })
+                            if role == "user":
+                                pending_user_text = content
+                            elif role == "assistant" and pending_user_text:
+                                user_text = pending_user_text
+                                pending_user_text = None
+                                persistence_task = asyncio.create_task(
+                                    persist_turn(user_text, content)
+                                )
+                                persistence_tasks.add(persistence_task)
+                                persistence_task.add_done_callback(
+                                    persistence_tasks.discard
+                                )
+                        elif event_type == "UserStartedSpeaking":
+                            await ws.send_json({"type": "interrupt"})
+                        elif event_type == "AgentThinking":
+                            await ws.send_json({"type": "processing"})
+                        elif event_type == "AgentStartedSpeaking":
+                            await ws.send_json({"type": "speaking"})
+                        elif event_type == "AgentAudioDone":
+                            await ws.send_json({"type": "audio_done"})
+                        elif event_type in {"Warning", "Error"}:
+                            await ws.send_json({
+                                "type": event_type.lower(),
+                                "message": event.get("description")
+                                or event.get("message")
+                                or "Deepgram Voice Agent hatası.",
+                            })
+                            if event_type == "Error":
+                                break
+
+                tasks = {
+                    asyncio.create_task(browser_to_agent()),
+                    asyncio.create_task(agent_to_browser()),
+                }
+                done, pending = await asyncio.wait(
+                    tasks, return_when=asyncio.FIRST_COMPLETED
                 )
-                history = await asyncio.to_thread(
-                    get_session_transcript_recent, session_id, 6
-                )
-                history_text = "\n".join(
-                    f"Kullanıcı: {row.get('user_message', '')}\n"
-                    f"Asistan: {row.get('bot_response', '')}"
-                    for row in history
-                )
-                profile_text = json.dumps(app_profile, ensure_ascii=False)
-                prompt = (
-                    f"{VOICE_AGENT_PROMPT}\n\n"
-                    f"KULLANICI ZEVK PROFİLİ: {profile_text}\n\n"
-                    f"SON KONUŞMALAR:\n{history_text or 'Henüz yok.'}"
-                )
-                answer, speech = await _deepgram_agent_text_response(
-                    transcript, prompt
-                )
-                await asyncio.to_thread(
-                    log_chat,
-                    session_id,
-                    user_id,
-                    username,
-                    transcript,
-                    answer,
-                )
-                await asyncio.to_thread(touch_session, session_id)
-                await ws.send_json({
-                    "type": "response",
-                    "transcript": transcript,
-                    "answer": answer,
-                    "recommended_movies": [],
-                    "session_id": session_id,
-                    "audio_format": "wav",
-                })
-                await ws.send_bytes(speech)
-            except Exception as exc:
-                print("Voice WebSocket işlem hatası:", repr(exc))
-                await ws.send_json({
-                    "type": "error",
-                    "message": str(exc) or "Ses işlenemedi.",
-                })
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+                for task in done:
+                    task.result()
+                if persistence_tasks:
+                    await asyncio.gather(
+                        *persistence_tasks, return_exceptions=True
+                    )
     except asyncio.TimeoutError:
         await ws.close(code=4001, message=b"Kimlik dogrulama zaman asimi")
     except (ConnectionResetError, asyncio.CancelledError):
         pass
+    except Exception as exc:
+        print("Voice streaming hatası:", repr(exc))
+        if not ws.closed:
+            await ws.send_json({
+                "type": "error",
+                "message": str(exc) or "Voice streaming hatası.",
+            })
 
     return ws
 
