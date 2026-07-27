@@ -43,8 +43,8 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_TRANSCRIPTIONS_URL = "https://openrouter.ai/api/v1/audio/transcriptions"
 OPENROUTER_SPEECH_URL = "https://openrouter.ai/api/v1/audio/speech"
 ASR_MODEL_NAME = os.environ.get("ASR_MODEL_NAME", "openai/whisper-large-v3")
-TTS_MODEL_NAME = os.environ.get("TTS_MODEL_NAME", "openai/gpt-4o-mini-tts-2025-12-15")
-TTS_VOICE = os.environ.get("TTS_VOICE", "nova")
+TTS_MODEL_NAME = os.environ.get("TTS_MODEL_NAME", "microsoft/mai-voice-2")
+TTS_VOICE = os.environ.get("TTS_VOICE", "tr-TR-Elif:MAI-Voice-2")
 
 
 VISION_MODEL_NAME = MODEL_NAME
@@ -130,7 +130,11 @@ def text_to_speech(text, voice=None):
             message = error.get("message") if isinstance(error, dict) else None
         except ValueError:
             message = None
-        raise RuntimeError(message or f"TTS servisi HTTP {response.status_code} hatası döndürdü.")
+        detail = message or f"HTTP {response.status_code}"
+        raise RuntimeError(
+            f"TTS isteği başarısız oldu "
+            f"(model={TTS_MODEL_NAME}, voice={voice or TTS_VOICE}): {detail}"
+        )
 
     if not response.content:
         raise RuntimeError("TTS servisi boş ses verisi döndürdü.")
@@ -234,6 +238,10 @@ def _call_openrouter(messages, tools=None, tool_choice=None, model=None, _retry=
         "model": model or MODEL_NAME,
         "temperature": 0.3,
         "messages": messages,
+        # Belirtilmediğinde OpenRouter modelin 65.536 tokenlık üst sınırını
+        # kullanıp bu en kötü senaryoya göre kredi yeterliliği kontrolü yapıyor.
+        # Bot cevapları için 1.200 token yeterli ve maliyet tahminini sınırlı tutar.
+        "max_tokens": 1200,
     }
     if tools:
         payload["tools"] = tools
@@ -505,9 +513,21 @@ def get_ai_response(
     app_profile=None,
     movie_name=None,
     include_diagnostics=False,
+    allow_stateless=False,
 ):
     # 1. OTURUMU BUL / OLUŞTUR (session bazlı yapı)
-    session_id = get_or_create_session(user_id, username)
+    stateless = False
+    try:
+        session_id = get_or_create_session(user_id, username)
+    except Exception as e:
+        if not allow_stateless:
+            raise
+        stateless = True
+        session_id = f"stateless-{user_id}"
+        print(
+            "SİSTEM UYARISI: Kalıcı hafıza kullanılamıyor; "
+            f"bu istek stateless çalışacak: {e}"
+        )
     tool_timings = []
 
     # Uygulama sorularında rehberi modelden önce deterministik olarak çağır.
@@ -548,12 +568,12 @@ def get_ai_response(
 
     # 2. BASİT BİLGİ ÇIKARIMI: mesajda isim gibi kesin bir bilgi varsa kalıcı profile hemen kaydet 
     new_facts = extract_simple_facts(user_message)
-    if new_facts:
+    if new_facts and not stateless:
         update_user_facts(user_id, username, new_facts)
 
     # 3. BOT CEVAP VERMEDEN ÖNCE KULLANICI GEÇMİŞİNİ ÇEK
     
-    user_facts = get_user_facts(user_id)
+    user_facts = {} if stateless else get_user_facts(user_id)
 
     # YENİ: Eğer bu kullanıcı için kayıtlı bir isim yoksa ve Cinematch
     # uygulamasından (Firebase Auth displayName) güvenilir bir ad geldiyse,
@@ -561,7 +581,12 @@ def get_ai_response(
     # tekrar yazmasına gerek kalmadan daha ilk mesajdan itibaren ismiyle
     # hitap edilebilir.
     _GENERIC_USERNAMES = {"anon", "api_user", "kullanıcı", "kullanici", "unknown", "flutter_user", ""}
-    if "isim" not in user_facts and username and username.strip().lower() not in _GENERIC_USERNAMES:
+    if (
+        not stateless
+        and "isim" not in user_facts
+        and username
+        and username.strip().lower() not in _GENERIC_USERNAMES
+    ):
         user_facts["isim"] = username.strip()
         update_user_facts(user_id, username, {"isim": username.strip()})
 
@@ -572,7 +597,15 @@ def get_ai_response(
     # olur, o zaman normal şekilde yoksayılır.
     app_profile_context = build_app_profile_context(app_profile)
 
-    history = get_user_history(user_id, session_id)
+    history = (
+        {
+            "past_summaries": [],
+            "current_session_summary": "",
+            "current_transcript": [],
+        }
+        if stateless
+        else get_user_history(user_id, session_id)
+    )
     background_context = build_background_context(history)
 
     system_prompt = f"""Sen profesyonel bir sinema asistanı ve film eleştirmenisin. Aynı zamanda CineMatch uygulamasının içindeki resmi yapay zeka asistanısın ve uygulamanın nasıl kullanılacağı hakkında da doğru bilgi verebilirsin.
@@ -757,14 +790,15 @@ sohbetin doğal devamıymış gibi bak, aynı cümleleri tekrar etme.
     final_answer, recommended_movies = extract_movie_recommendations(final_answer)
 
     # 5. TAM KONUŞMA DÖKÜMÜNE KAYDET 
-    log_chat(session_id, user_id, username, user_message, final_answer)
+    if not stateless:
+        log_chat(session_id, user_id, username, user_message, final_answer)
 
-    # 6. OTURUM SAYACINI GÜNCELLE
-    message_count = touch_session(session_id)
+        # 6. OTURUM SAYACINI GÜNCELLE
+        message_count = touch_session(session_id)
 
-    # 7. BELİRLİ ARALIKLARLA ÖZETİ GÜNCELLEYEN ARACI TETİKLE
-    if message_count % SUMMARY_UPDATE_INTERVAL == 0:
-        summarize_session(session_id)
+        # 7. BELİRLİ ARALIKLARLA ÖZETİ GÜNCELLEYEN ARACI TETİKLE
+        if message_count % SUMMARY_UPDATE_INTERVAL == 0:
+            summarize_session(session_id)
 
     if include_diagnostics:
         return final_answer, recommended_movies, session_id, {
@@ -871,3 +905,36 @@ KULLANICI GEÇMİŞİ (arka plan):
         summarize_session(session_id)
 
     return final_answer
+def _call_openrouter_stream(messages, model=None):
+    """
+    OpenRouter'dan streaming (akış) ile cevap alır.
+    Cevap oluştukça kelime kelime (token) yield eder.
+    """
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": model or MODEL_NAME,
+        "temperature": 0.3,
+        "messages": messages,
+        "max_tokens": 1200,
+        "stream": True
+    }
+    
+    response = requests.post(OPENROUTER_URL, headers=headers, json=payload, stream=True)
+    
+    for line in response.iter_lines():
+        if line:
+            decoded_line = line.decode('utf-8')
+            if decoded_line.startswith("data: "):
+                data_str = decoded_line[6:]
+                if data_str == "[DONE]":
+                    break
+                try:
+                    data_json = json.loads(data_str)
+                    token = data_json.get("choices", [{}])[0].get("delta", {}).get("content", "")
+                    if token:
+                        yield token
+                except json.JSONDecodeError:
+                    continue
