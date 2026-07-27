@@ -866,7 +866,10 @@ async def voice_stream(request):
                 deepgram_request_id = None
                 turn_number = 0
                 client_interrupt_started = None
-                latency_logged_for_turn = False
+                latency_event = {}
+                turn_metric_logged = False
+                user_transcript_ready_at = None
+                assistant_text_ready_at = None
 
                 def track_persistence_task(task):
                     persistence_tasks.discard(task)
@@ -887,27 +890,38 @@ async def voice_stream(request):
                     )
                     await asyncio.to_thread(touch_session, session_id)
 
-                async def persist_latency(event):
+                async def persist_latency(first_audio_at):
                     nonlocal turn_number
                     turn_number += 1
 
                     def milliseconds(field):
-                        value = event.get(field)
+                        value = latency_event.get(field)
                         if isinstance(value, (int, float)):
                             return round(value * 1000)
                         return None
 
-                    ai_ms = milliseconds("ttt_text_latency")
-                    if ai_ms is None:
-                        ai_ms = milliseconds("ttt_token_latency")
-                    if ai_ms is None:
-                        ai_ms = milliseconds("ttt_latency")
-                    tts_ms = milliseconds("tts_latency")
+                    ai_ms = (
+                        round(
+                            (
+                                assistant_text_ready_at
+                                - user_transcript_ready_at
+                            )
+                            * 1000
+                        )
+                        if (
+                            assistant_text_ready_at is not None
+                            and user_transcript_ready_at is not None
+                        )
+                        else milliseconds("ttt_text_latency")
+                    )
+                    tts_ms = (
+                        round(
+                            (first_audio_at - assistant_text_ready_at) * 1000
+                        )
+                        if assistant_text_ready_at is not None
+                        else milliseconds("tts_latency")
+                    )
                     e2e_ms = milliseconds("total_latency")
-                    if ai_ms is None and e2e_ms is not None:
-                        # Bazı sağlayıcı/turlarda yalnızca total + TTS gelir.
-                        # Belge admin başarı kohortundan düşmesin.
-                        ai_ms = max(0, e2e_ms - (tts_ms or 0))
                     asr_ms = None
                     if e2e_ms is not None and ai_ms is not None and tts_ms is not None:
                         # Deepgram ayrı STT alanı vermiyor. Total = utterance
@@ -918,6 +932,7 @@ async def voice_stream(request):
                     metric = {
                         "channel": "voice_websocket",
                         "input_type": "streaming_audio",
+                        "metric_version": 2,
                         "user_id": user_id,
                         "username": username,
                         "session_id": session_id,
@@ -994,10 +1009,22 @@ async def voice_stream(request):
                     nonlocal interrupted_user_committed
                     nonlocal deepgram_request_id
                     nonlocal client_interrupt_started
-                    nonlocal latency_logged_for_turn
+                    nonlocal latency_event
+                    nonlocal turn_metric_logged
+                    nonlocal user_transcript_ready_at
+                    nonlocal assistant_text_ready_at
                     async for message in agent_ws:
                         if message.type == aiohttp.WSMsgType.BINARY:
                             if not drop_interrupted_audio:
+                                if not turn_metric_logged:
+                                    turn_metric_logged = True
+                                    latency_task = asyncio.create_task(
+                                        persist_latency(time.perf_counter())
+                                    )
+                                    persistence_tasks.add(latency_task)
+                                    latency_task.add_done_callback(
+                                        track_persistence_task
+                                    )
                                 await ws.send_bytes(message.data)
                             continue
                         if message.type != aiohttp.WSMsgType.TEXT:
@@ -1049,9 +1076,14 @@ async def voice_stream(request):
                             })
                             if role == "user":
                                 pending_user_text = content
+                                user_transcript_ready_at = time.perf_counter()
+                                assistant_text_ready_at = None
+                                turn_metric_logged = False
                                 if drop_interrupted_audio:
                                     interrupted_user_committed = True
                             elif role == "assistant" and pending_user_text:
+                                if assistant_text_ready_at is None:
+                                    assistant_text_ready_at = time.perf_counter()
                                 user_text = pending_user_text
                                 pending_user_text = None
                                 persistence_task = asyncio.create_task(
@@ -1062,27 +1094,30 @@ async def voice_stream(request):
                                     track_persistence_task
                                 )
                         elif event_type == "UserStartedSpeaking":
-                            latency_logged_for_turn = False
+                            latency_event = {}
+                            turn_metric_logged = False
+                            user_transcript_ready_at = None
+                            assistant_text_ready_at = None
                             drop_interrupted_audio = True
                             interrupted_user_committed = bool(pending_user_text)
                             await ws.send_json({"type": "interrupt"})
                         elif event_type == "AgentThinking":
                             await ws.send_json({"type": "processing"})
                         elif event_type == "AgentStartedSpeaking":
-                            if (
-                                not latency_logged_for_turn
-                                and isinstance(event.get("total_latency"), (int, float))
+                            for field in (
+                                "ttt_latency",
+                                "tts_latency",
+                                "total_latency",
                             ):
-                                latency_task = asyncio.create_task(
-                                    persist_latency(event)
-                                )
-                                persistence_tasks.add(latency_task)
-                                latency_task.add_done_callback(
-                                    track_persistence_task
-                                )
-                                latency_logged_for_turn = True
+                                if isinstance(event.get(field), (int, float)):
+                                    latency_event[field] = event[field]
                             if drop_interrupted_audio and not interrupted_user_committed:
                                 continue
+                            if (
+                                assistant_text_ready_at is None
+                                and user_transcript_ready_at is not None
+                            ):
+                                assistant_text_ready_at = time.perf_counter()
                             client_interrupt_started = None
                             drop_interrupted_audio = False
                             interrupted_user_committed = False
@@ -1090,14 +1125,11 @@ async def voice_stream(request):
                         elif event_type == "AgentAudioDone":
                             await ws.send_json({"type": "audio_done"})
                         elif event_type == "LatencyReport":
-                            latency_task = asyncio.create_task(
-                                persist_latency(event)
-                            )
-                            persistence_tasks.add(latency_task)
-                            latency_task.add_done_callback(
-                                track_persistence_task
-                            )
-                            latency_logged_for_turn = True
+                            latency_event.update({
+                                key: value
+                                for key, value in event.items()
+                                if isinstance(value, (int, float))
+                            })
                         elif event_type in {"Warning", "Error"}:
                             await ws.send_json({
                                 "type": event_type.lower(),

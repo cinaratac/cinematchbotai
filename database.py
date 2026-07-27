@@ -678,9 +678,14 @@ def get_performance_metrics_averages(sample_size=200, session_id=None):
         ai_ms = data.get("ai_ms")
         ttfb_ms = data.get("ttfb_ms")
         e2e_ms = data.get("e2e_ms")
+        voice_schema_valid = (
+            data.get("channel") != "voice_websocket"
+            or data.get("metric_version") == 2
+        )
         valid = (
             data.get("status") == "success"
             and data.get("measurement_valid", True) is not False
+            and voice_schema_valid
             and is_number(ai_ms)
             and is_number(ttfb_ms)
             and is_number(e2e_ms)
