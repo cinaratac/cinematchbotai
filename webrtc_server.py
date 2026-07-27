@@ -16,7 +16,7 @@ from aiortc import (
 )
 from av import AudioFrame
 from av.audio.resampler import AudioResampler
-from ai_service import get_ai_response, text_to_speech
+from ai_service import get_ai_response, text_to_speech, transcribe_audio
 from app_guide import CINEMATCH_APP_GUIDE
 
 # Ortam değişkenlerinden Deepgram anahtarını alıyoruz
@@ -715,6 +715,112 @@ async def options_handler(request):
         return web.Response(status=403, headers=headers)
     return web.Response(status=204, headers=headers)
 
+
+async def voice_stream(request):
+    """TURN gerektirmeyen, ai_service tabanlı sesli sohbet WebSocket'i."""
+    cors_headers = _cors_headers(request)
+    if request.headers.get("Origin") and "Access-Control-Allow-Origin" not in cors_headers:
+        return web.json_response(
+            {"status": "error", "message": "Bu origin için erişim izni yok."},
+            status=403,
+            headers=cors_headers,
+        )
+
+    ws = web.WebSocketResponse(heartbeat=20, max_msg_size=15 * 1024 * 1024)
+    await ws.prepare(request)
+
+    try:
+        auth_message = await asyncio.wait_for(ws.receive(), timeout=10)
+        if auth_message.type != aiohttp.WSMsgType.TEXT:
+            await ws.close(code=4001, message=b"Kimlik dogrulama gerekli")
+            return ws
+
+        try:
+            context = json.loads(auth_message.data)
+        except json.JSONDecodeError:
+            context = {}
+
+        if (
+            context.get("type") != "auth"
+            or not VOICE_API_KEY
+            or context.get("api_key") != VOICE_API_KEY
+        ):
+            await ws.send_json({"type": "error", "message": "Yetkisiz erişim."})
+            await ws.close(code=4001, message=b"Yetkisiz")
+            return ws
+
+        user_id = str(context.get("user_id") or "voice-user")
+        username = str(context.get("username") or "Voice User")
+        app_profile = {
+            "favorite_genres": context.get("favorite_genres") or [],
+            "favorite_directors": context.get("favorite_directors") or [],
+            "favorite_actors": context.get("favorite_actors") or [],
+            "favorite_movies": context.get("favorite_movies") or [],
+        }
+        audio_format = "webm"
+        await ws.send_json({"type": "ready"})
+
+        async for message in ws:
+            if message.type == aiohttp.WSMsgType.TEXT:
+                try:
+                    command = json.loads(message.data)
+                except json.JSONDecodeError:
+                    continue
+                if command.get("type") == "utterance":
+                    audio_format = str(command.get("format") or "webm")[:12]
+                continue
+
+            if message.type != aiohttp.WSMsgType.BINARY:
+                if message.type in {
+                    aiohttp.WSMsgType.CLOSE,
+                    aiohttp.WSMsgType.CLOSED,
+                    aiohttp.WSMsgType.ERROR,
+                }:
+                    break
+                continue
+
+            if not message.data:
+                continue
+
+            await ws.send_json({"type": "processing"})
+            try:
+                transcript = await asyncio.to_thread(
+                    transcribe_audio,
+                    bytes(message.data),
+                    audio_format=audio_format,
+                    language="tr",
+                )
+                answer, movies, session_id = await asyncio.to_thread(
+                    get_ai_response,
+                    transcript,
+                    user_id=user_id,
+                    username=username,
+                    app_profile=app_profile,
+                )
+                speech = await asyncio.to_thread(text_to_speech, answer)
+                await ws.send_json({
+                    "type": "response",
+                    "transcript": transcript,
+                    "answer": answer,
+                    "recommended_movies": movies,
+                    "session_id": session_id,
+                    "audio_format": "mp3",
+                })
+                await ws.send_bytes(speech)
+            except Exception as exc:
+                print("Voice WebSocket işlem hatası:", repr(exc))
+                await ws.send_json({
+                    "type": "error",
+                    "message": str(exc) or "Ses işlenemedi.",
+                })
+    except asyncio.TimeoutError:
+        await ws.close(code=4001, message=b"Kimlik dogrulama zaman asimi")
+    except (ConnectionResetError, asyncio.CancelledError):
+        pass
+
+    return ws
+
+
 async def close_peer_connections(app):
     await asyncio.gather(
         *(pc.close() for pc in tuple(PEER_CONNECTIONS)),
@@ -728,6 +834,7 @@ def create_app():
     from main import app as flask_app
 
     app = web.Application()
+    app.router.add_get("/api/voice/stream", voice_stream)
     app.router.add_post("/api/voice/offer", offer)
     app.router.add_options("/api/voice/offer", options_handler)
     app.router.add_route("*", "/{path_info:.*}", WSGIHandler(flask_app))
