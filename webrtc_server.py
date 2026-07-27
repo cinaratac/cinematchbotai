@@ -1181,13 +1181,26 @@ async def close_peer_connections(app):
 
 def create_app():
     # Flask REST/Telegram API'sini ve WebRTC sinyallemesini aynı portta yayınla.
-    from main import app as flask_app
+    # Firestore/Telegram ağ çağrıları portun açılmasını geciktirmesin.
+    os.environ["CINEMATCH_DEFER_SERVICE_INITIALIZATION"] = "1"
+    import main as main_module
 
     app = web.Application()
     app.router.add_get("/api/voice/stream", voice_stream)
     app.router.add_post("/api/voice/offer", offer)
     app.router.add_options("/api/voice/offer", options_handler)
-    app.router.add_route("*", "/{path_info:.*}", WSGIHandler(flask_app))
+    app.router.add_route("*", "/{path_info:.*}", WSGIHandler(main_module.app))
+
+    async def start_external_services(aiohttp_app):
+        # on_startup içinde işi yalnızca planlıyoruz; await etmediğimiz için
+        # aiohttp hemen $PORT üzerinde dinlemeye başlayabilir.
+        task = asyncio.create_task(
+            asyncio.to_thread(main_module.initialize_services),
+            name="cinematch-service-initialization",
+        )
+        aiohttp_app["service_initialization_task"] = task
+
+    app.on_startup.append(start_external_services)
     app.on_shutdown.append(close_peer_connections)
     return app
 

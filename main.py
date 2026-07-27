@@ -58,31 +58,30 @@ app.register_blueprint(admin_bp)
 
 def _register_webhook():
     """Telegram'a, gelen mesajları PUBLIC_BASE_URL/{TOKEN} adresine göndermesini
-    söyler. Bu fonksiyon modül YÜKLENİRKEN (aşağıda) otomatik çağrılıyor; bu
-    sayede webhook her deploy'da/başlatmada otomatik doğru adrese işaret eder
-    ve artık kimsenin bilgisayarından elle "/" adresine gidip webhook'u
-    ayarlaması gerekmiyor -- bu yüzden bot "lokalde başlatılmayı bekliyor" gibi
-    davranıyordu."""
+    söyler."""
     if not bot:
         print("UYARI: TELEGRAM_BOT_TOKEN tanımlı değil; Telegram botu devre dışı, sadece /api/chat aktif.")
         return
     try:
         bot.remove_webhook()
         bot.set_webhook(url=f"{PUBLIC_BASE_URL}/{TOKEN}")
-        print(f"Telegram webhook ayarlandı: {PUBLIC_BASE_URL}/{TOKEN}")
+        # Bot tokenı webhook yolunun bir parçasıdır; deploy loguna yazmayalım.
+        print("Telegram webhook ayarlandı.")
     except Exception as e:
         print("WEBHOOK AYARLAMA HATASI:", e)
 
 
-# YENİ: setup_database() ve webhook kaydı artık modül IMPORT edilirken
-# çalışıyor (aşağıda), "if __name__ == '__main__'" bloğunun İÇİNDE DEĞİL.
-# Render'da bu dosya `gunicorn main:app` ile başlatılıyor; gunicorn dosyayı
-# sadece IMPORT eder, `python main.py` gibi doğrudan ÇALIŞTIRMAZ. Yani o blok
-# Render'da hiç çalışmıyordu -- ne veritabanı kurulumu ne de webhook kaydı
-# güvenilir şekilde tetikleniyordu. Şimdi ikisi de import anında (yani hem
-# `python main.py` hem `gunicorn main:app` ile) çalışıyor.
-setup_database()
-_register_webhook()
+def initialize_services():
+    """Firestore ve Telegram gibi dış servisleri başlatır."""
+    setup_database()
+    _register_webhook()
+
+
+# Gunicorn ile yalnızca main:app çalıştırıldığında eski davranışı koru.
+# Birleşik aiohttp sunucusu bu değeri importtan önce ayarlar ve kurulumu port
+# açıldıktan sonra arka planda başlatır; böylece Render port taraması beklemez.
+if os.environ.get("CINEMATCH_DEFER_SERVICE_INITIALIZATION") != "1":
+    initialize_services()
 
 
 if bot:
@@ -501,14 +500,10 @@ def health_check():
     etmesi için basit bir health-check ucu. ARTIK BURADA webhook ayarlamıyoruz
     -- eskiden bu route ziyaret edildiğinde webhook'u NGROK_URL'e (yerel
     makineye) yeniden yönlendiriyordu, bu da botu "lokal bilgisayar açık
-    olmalı" durumuna sokan asıl sebepti. Webhook artık modül import
-    edilirken bir kez, doğru (PUBLIC_BASE_URL) adrese otomatik ayarlanıyor."""
+    olmalı" durumuna sokan asıl sebepti."""
     return {"status": "ok", "telegram_enabled": bot is not None}, 200
 
 
 if __name__ == "__main__":
-    # Not: setup_database() ve _register_webhook() artık yukarıda, modül
-    # importunda çalışıyor; burada tekrar çağırmaya gerek yok. Bu blok sadece
-    # `python main.py` ile SAF YEREL geliştirme yaparken devreye girer
-    # (Render prod'da gunicorn kullanıldığı için bu blok hiç çalışmaz).
+    # initialize_services() yukarıda çağrıldı; burada tekrar çağırmaya gerek yok.
     app.run(host="0.0.0.0", port=5001)
