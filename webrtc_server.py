@@ -1013,6 +1013,19 @@ async def voice_stream(request):
                                 # Kesilmiş cevabın geç ulaşan metnini istemciye
                                 # gönderme ve yeni turun parçası gibi kaydetme.
                                 continue
+                            if (
+                                role == "assistant"
+                                and drop_interrupted_audio
+                                and interrupted_user_committed
+                            ):
+                                # Deepgram bazen AgentStartedSpeaking olayını
+                                # ConversationText'ten önce yollar. Yeni kullanıcı
+                                # turuna ait assistant metni kesinleştiğinde ses
+                                # kapısını mutlaka yeniden aç.
+                                drop_interrupted_audio = False
+                                interrupted_user_committed = False
+                                client_interrupt_started = None
+                                await ws.send_json({"type": "speaking"})
                             await ws.send_json({
                                 "type": "transcript",
                                 "role": role,
