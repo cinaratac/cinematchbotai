@@ -148,16 +148,26 @@ def update_session_summary(session_id, summary_text):
 # TAM KONUŞMA DÖKÜMÜ (TRANSCRIPT)
 # ============================================================
 
-def log_chat(session_id, user_id, username, user_message, bot_response):
+def log_chat(
+    session_id,
+    user_id,
+    username,
+    user_message,
+    bot_response,
+    recording_id=None,
+):
     db = _get_db()
-    db.collection(COL_CHAT_LOGS).document().set({
+    payload = {
         "session_id": session_id,
         "user_id": str(user_id),
         "username": username,
         "user_message": user_message,
         "bot_response": bot_response,
         "created_at": _now(),
-    })
+    }
+    if recording_id:
+        payload["recording_id"] = recording_id
+    db.collection(COL_CHAT_LOGS).document().set(payload)
     print("LOG BAŞARILI: Mesaj Firestore'a kaydedildi.")
 
 
@@ -349,6 +359,25 @@ def get_voice_recording_download_url(recording_id, track):
     )
 
 
+def download_voice_recording_audio(recording_id, track="user"):
+    """QA işleyicisi için private Firebase Storage kaydını byte olarak döndürür."""
+    if track not in {"user", "agent"}:
+        raise ValueError("track user veya agent olmalıdır.")
+    doc = (
+        _get_db()
+        .collection(COL_VOICE_RECORDINGS)
+        .document(recording_id)
+        .get()
+    )
+    if not doc.exists:
+        raise RuntimeError("Voice kaydı Firestore'da bulunamadı.")
+    storage_path = (doc.to_dict() or {}).get(f"{track}_storage_path")
+    bucket_name = _storage_bucket_name()
+    if not storage_path or not bucket_name:
+        raise RuntimeError("Voice kaydının Storage yolu bulunamadı.")
+    return storage.bucket(bucket_name).blob(storage_path).download_as_bytes()
+
+
 def start_voice_ai_evaluation(session_id, recording_id, model_chain):
     ref = _get_db().collection(COL_VOICE_AI_EVALUATIONS).document(recording_id)
     ref.set({
@@ -416,6 +445,24 @@ def get_voice_ai_evaluations_admin(session_id):
         data["updated_at"] = _iso(data.get("updated_at"))
         rows.append({"id": doc.id, **data})
     return rows
+
+
+def get_recording_transcript(recording_id, limit=100):
+    """Yalnızca tek bir voice WAV kaydı sırasında oluşan konuşma turları."""
+    docs = list(
+        _get_db().collection(COL_CHAT_LOGS)
+        .where(filter=FieldFilter("recording_id", "==", recording_id))
+        .limit(limit)
+        .stream()
+    )
+    docs.sort(
+        key=lambda d: (
+            d.to_dict().get("created_at").timestamp()
+            if isinstance(d.to_dict().get("created_at"), datetime)
+            else 0
+        )
+    )
+    return [{"id": doc.id, **doc.to_dict()} for doc in docs]
 
 
 def get_session_transcript(session_id, limit=50):

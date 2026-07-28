@@ -21,6 +21,10 @@ from voice.config import (
 from voice.recording import VoiceRecordingSession
 from voice.metrics import build_voice_metric
 from voice.barge_in import BargeInState
+from voice.activity import (
+    voice_connection_finished,
+    voice_connection_started,
+)
 
 
 def _streaming_agent_settings(app_profile, history, input_sample_rate):
@@ -106,6 +110,7 @@ async def voice_stream(request):
     ws = web.WebSocketResponse(heartbeat=20, max_msg_size=15 * 1024 * 1024)
     await ws.prepare(request)
     recording = None
+    connection_registered = False
 
     try:
         auth_message = await asyncio.wait_for(ws.receive(), timeout=10)
@@ -148,6 +153,8 @@ async def voice_stream(request):
         if input_sample_rate < 8000 or input_sample_rate > 48000:
             input_sample_rate = 48000
 
+        voice_connection_started()
+        connection_registered = True
         recording = VoiceRecordingSession.create_if_enabled(
             session_id,
             user_id,
@@ -195,6 +202,7 @@ async def voice_stream(request):
                         username,
                         user_text,
                         assistant_text,
+                        recording.recording_id if recording else None,
                     )
                     await asyncio.to_thread(touch_session, session_id)
 
@@ -491,6 +499,8 @@ async def voice_stream(request):
                 "message": str(exc) or "Voice streaming hatası.",
             })
     finally:
+        if connection_registered:
+            voice_connection_finished()
         if recording:
             await recording.finalize()
 

@@ -7,12 +7,15 @@ import aiohttp
 
 from database import (
     complete_voice_ai_evaluation,
+    download_voice_recording_audio,
     fail_voice_ai_evaluation,
     get_performance_metrics_averages,
+    get_recording_transcript,
     get_session_transcript,
     skip_voice_ai_evaluation,
     start_voice_ai_evaluation,
 )
+from voice.activity import wait_for_voice_idle
 
 
 
@@ -25,6 +28,9 @@ EVALUATION_MODEL = os.environ.get(
 EVALUATION_TASKS = set()
 
 CRITERIA = {
+    "speech_recognition_accuracy": (
+        "Gerçek kullanıcı sesinin agent transkriptine doğru aktarılması"
+    ),
     "intent_understanding": "Kullanıcının niyetini doğru anlama",
     "answer_relevance": "Cevabın soruyla doğrudan ilgili olması",
     "accuracy": "Olgusal doğruluk ve halüsinasyondan kaçınma",
@@ -39,9 +45,14 @@ CRITERIA = {
 
 EVALUATOR_PROMPT = """
 Sen CineMatch Voice Agent görüşmelerini denetleyen bağımsız QA agentısın.
-Sana verilen transkripti ve performans özetini yalnızca kanıta dayanarak
-değerlendir. Her kriteri 0-10 arasında puanla. Transkriptte gözlenemeyen bir
-kriter için score=null ve observed=false kullan; veri uydurma.
+Kullanıcı ses kaydı bağımsız olarak yeniden yazıya çevrilmiştir. Sana bu
+audio_transcript ile canlı voice agentın ürettiği logged_transcript ve
+performans özeti verilir. Önce iki transkripti karşılaştır; yanlış anlaşılan,
+atlanmış veya anlamı değiştirilmiş ifadeleri belirle. Sonra agent cevaplarının
+gerçekte söylenenlere uygunluğunu değerlendir. Her kriteri 0-10 arasında
+puanla. Gözlenemeyen kriter için score=null ve observed=false kullan.
+Veri uydurma. Belirgin konuşma tanıma hataları varsa bunları issue olarak
+raporla ve overall_score değerini gereksiz şekilde yüksek verme.
 
 Sonucu serbest metin olarak yazma. Daima submit_evaluation fonksiyonunu çağır.
 Fonksiyon argümanlarını aşağıdaki şemaya göre doldur:
@@ -72,7 +83,18 @@ Fonksiyon argümanlarını aşağıdaki şemaya göre doldur:
       "expected_effect": "beklenen sonuç",
       "evidence": "bu görüşmedeki dayanak"
     }
-  ]
+  ],
+  "transcript_comparison": {
+    "match_score": 0-100,
+    "summary": "ses temelli ve agent transkriptinin karşılaştırması",
+    "mismatches": [
+      {
+        "audio_says": "bağımsız STT sonucu",
+        "agent_understood": "canlı agent transkripti",
+        "impact": "yanlış anlamanın cevaba etkisi"
+      }
+    ]
+  }
 }
 
 Prompt önerisi yalnızca transkriptte gerçek bir problem varsa üret. Sistem
@@ -159,6 +181,30 @@ EVALUATION_FUNCTION = {
                     ],
                 },
             },
+            "transcript_comparison": {
+                "type": "object",
+                "properties": {
+                    "match_score": {"type": "number"},
+                    "summary": {"type": "string"},
+                    "mismatches": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "audio_says": {"type": "string"},
+                                "agent_understood": {"type": "string"},
+                                "impact": {"type": "string"},
+                            },
+                            "required": [
+                                "audio_says",
+                                "agent_understood",
+                                "impact",
+                            ],
+                        },
+                    },
+                },
+                "required": ["match_score", "summary", "mismatches"],
+            },
         },
         "required": [
             "overall_score",
@@ -167,6 +213,7 @@ EVALUATION_FUNCTION = {
             "issues",
             "strengths",
             "prompt_recommendations",
+            "transcript_comparison",
         ],
     },
 }
@@ -214,7 +261,77 @@ def _validate_result(result):
     result["prompt_recommendations"] = list(
         result.get("prompt_recommendations") or []
     )[:15]
+    comparison = result.get("transcript_comparison") or {}
+    match_score = comparison.get("match_score")
+    if not isinstance(match_score, (int, float)):
+        raise ValueError("transcript_comparison.match_score eksik.")
+    comparison["match_score"] = max(0, min(100, match_score))
+    comparison["summary"] = str(comparison.get("summary") or "")[:2000]
+    comparison["mismatches"] = list(
+        comparison.get("mismatches") or []
+    )[:30]
+    result["transcript_comparison"] = comparison
+    # Model, diğer kriterler iyi diye ciddi STT hatalarını örtemesin.
+    # Ses-transkript eşleşmesi düşükse toplam kalite puanına deterministik tavan koy.
+    if comparison["match_score"] < 60:
+        result["overall_score"] = min(result["overall_score"], 60)
+    elif comparison["match_score"] < 80:
+        result["overall_score"] = min(result["overall_score"], 75)
     return result
+
+
+async def _transcribe_recording(recording_id):
+    """Firebase'deki gerçek kullanıcı WAV kaydını bağımsız olarak yazıya çevir."""
+    if not DEEPGRAM_API_KEY:
+        raise RuntimeError("DEEPGRAM_API_KEY tanımlı değil.")
+    audio_bytes = await asyncio.to_thread(
+        download_voice_recording_audio,
+        recording_id,
+        "user",
+    )
+    if not audio_bytes:
+        raise RuntimeError("Kullanıcı ses kaydı boş.")
+    timeout = aiohttp.ClientTimeout(total=180)
+    params = {
+        "model": "nova-3",
+        "language": "tr",
+        "smart_format": "true",
+        "utterances": "true",
+        "punctuate": "true",
+    }
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(
+            "https://api.deepgram.com/v1/listen",
+            params=params,
+            headers={
+                "Authorization": f"Token {DEEPGRAM_API_KEY}",
+                "Content-Type": "audio/wav",
+            },
+            data=audio_bytes,
+        ) as response:
+            body = await response.json(content_type=None)
+            if response.status >= 400:
+                raise RuntimeError(
+                    f"Ses kaydı STT hatası ({response.status}): {body}"
+                )
+    alternatives = (
+        body.get("results", {})
+        .get("channels", [{}])[0]
+        .get("alternatives", [])
+    )
+    transcript = (
+        str(alternatives[0].get("transcript") or "").strip()
+        if alternatives
+        else ""
+    )
+    if not transcript:
+        raise RuntimeError("Ses kaydından bağımsız transkript çıkarılamadı.")
+    print(
+        "Voice QA ses kaydı yeniden transkript edildi:",
+        recording_id,
+        f"chars={len(transcript)}",
+    )
+    return transcript
 
 
 async def _call_deepgram_evaluator(payload, provider_type, model):
@@ -349,6 +466,11 @@ async def evaluate_voice_session(session_id, recording_id):
         ("open_ai", "gpt-4o-mini"),
     ]
     try:
+        print(
+            "Voice AI değerlendirmesi canlı görüşmelerin bitmesini bekliyor:",
+            recording_id,
+        )
+        await wait_for_voice_idle(grace_seconds=15)
         await asyncio.to_thread(
             start_voice_ai_evaluation,
             session_id,
@@ -358,8 +480,14 @@ async def evaluate_voice_session(session_id, recording_id):
             ),
         )
         transcript = await asyncio.to_thread(
-            get_session_transcript, session_id, 100
+            get_recording_transcript, recording_id, 100
         )
+        # Eski kayıtlar recording_id alanı eklenmeden oluşturulmuş olabilir.
+        # Onlar için geriye dönük olarak oturumun son turlarını kullan.
+        if not transcript:
+            transcript = await asyncio.to_thread(
+                get_session_transcript, session_id, 20
+            )
         if not transcript:
             await asyncio.to_thread(
                 skip_voice_ai_evaluation,
@@ -371,6 +499,7 @@ async def evaluate_voice_session(session_id, recording_id):
                 recording_id,
             )
             return
+        audio_transcript = await _transcribe_recording(recording_id)
         performance = await asyncio.to_thread(
             get_performance_metrics_averages,
             200,
@@ -393,7 +522,8 @@ async def evaluate_voice_session(session_id, recording_id):
         }
         evaluation_payload = {
             "criteria": CRITERIA,
-            "transcript": turns,
+            "audio_transcript": audio_transcript,
+            "logged_transcript": turns,
             "performance_metrics_ms": performance_summary,
         }
         provider_errors = []
@@ -426,6 +556,10 @@ async def evaluate_voice_session(session_id, recording_id):
         result = _validate_result(raw_result)
         result["evaluator_provider"] = used_provider
         result["evaluator_model"] = used_model
+        result["audio_transcript"] = audio_transcript
+        result["logged_user_transcript"] = [
+            turn["user"] for turn in turns if turn.get("user")
+        ]
         await asyncio.to_thread(
             complete_voice_ai_evaluation, recording_id, result
         )
