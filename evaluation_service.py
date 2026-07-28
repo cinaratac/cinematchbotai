@@ -318,6 +318,75 @@ def _transcript_match_score(audio_text, logged_user_texts):
     )
 
 
+def _contains_quoted_evidence(source_text, claimed_text):
+    source = _normalize_transcript(source_text)
+    claimed = _normalize_transcript(claimed_text)
+    return bool(claimed and len(claimed.split()) >= 2 and claimed in source)
+
+
+def _has_evidence_overlap(source_text, evidence):
+    """Serbest kanıtta kaynak dökümden en az bir gerçek iki kelimelik parça ara."""
+    source_words = _normalize_transcript(source_text).split()
+    evidence_words = _normalize_transcript(evidence).split()
+    if len(evidence_words) < 2:
+        return False
+    source_pairs = set(zip(source_words, source_words[1:]))
+    return any(
+        pair in source_pairs
+        for pair in zip(evidence_words, evidence_words[1:])
+    )
+
+
+def _validate_qa_evidence(result, audio_text, turns):
+    """LLM'nin transkriptte bulunmayan kanıtlarla rapor üretmesini reddet."""
+    if not isinstance(result, dict):
+        raise ValueError("QA sonucu nesne değil.")
+    logged_users = " ".join(
+        str(turn.get("user") or "") for turn in turns
+    )
+    all_transcript = " ".join([
+        audio_text,
+        logged_users,
+        *(
+            str(turn.get("assistant") or "")
+            for turn in turns
+        ),
+    ])
+    comparison = result.get("transcript_comparison") or {}
+    mismatches = comparison.get("mismatches") or []
+    valid_mismatch_count = 0
+    for mismatch in mismatches:
+        if not isinstance(mismatch, dict):
+            raise ValueError("QA uyuşmazlık kanıtı nesne değil.")
+        audio_says = mismatch.get("audio_says")
+        agent_understood = mismatch.get("agent_understood")
+        if not (
+            _contains_quoted_evidence(audio_text, audio_says)
+            and _contains_quoted_evidence(logged_users, agent_understood)
+        ):
+            raise ValueError(
+                "QA transkriptte bulunmayan STT uyuşmazlığı üretti: "
+                f"audio={audio_says!r}, logged={agent_understood!r}"
+            )
+        valid_mismatch_count += 1
+    for issue in result.get("issues") or []:
+        if not isinstance(issue, dict):
+            raise ValueError("QA issue kaydı nesne değil.")
+        if not _has_evidence_overlap(all_transcript, issue.get("evidence")):
+            raise ValueError(
+                "QA issue kanıtı konuşma dökümünde bulunamadı: "
+                f"{issue.get('evidence')!r}"
+            )
+        if (
+            issue.get("type") == "speech_recognition_error"
+            and valid_mismatch_count == 0
+        ):
+            raise ValueError(
+                "QA doğrulanmış uyuşmazlık olmadan STT hatası üretti."
+            )
+    return result
+
+
 def _validate_result(result):
     if not isinstance(result, dict):
         raise ValueError("Değerlendirme sonucu nesne değil.")
@@ -700,11 +769,17 @@ async def evaluate_voice_session(session_id, recording_id):
         used_model = None
         for provider_type, model in provider_chain:
             try:
-                raw_result = await _call_deepgram_evaluator(
+                candidate_result = await _call_deepgram_evaluator(
                     evaluation_payload,
                     provider_type,
                     model,
                 )
+                _validate_qa_evidence(
+                    candidate_result,
+                    audio_transcript,
+                    turns,
+                )
+                raw_result = candidate_result
                 used_provider = provider_type
                 used_model = model
                 break
