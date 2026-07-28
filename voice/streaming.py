@@ -272,7 +272,24 @@ async def voice_stream(request):
                             aiohttp.WSMsgType.CLOSED,
                             aiohttp.WSMsgType.ERROR,
                         }:
+                            print(
+                                "Voice stream tarayıcı bağlantısı sonlandı:",
+                                f"type={message.type.name}",
+                                f"exception={ws.exception()!r}",
+                            )
                             break
+                    print(
+                        "Voice stream tarayıcı okuma döngüsü bitti:",
+                        f"closed={ws.closed}",
+                        f"close_code={ws.close_code}",
+                    )
+
+                async def keep_agent_alive():
+                    """Tarayıcı durumundan bağımsız olarak Deepgram oturumunu canlı tut."""
+                    while not agent_ws.closed:
+                        await asyncio.sleep(5)
+                        if not agent_ws.closed:
+                            await agent_ws.send_json({"type": "KeepAlive"})
 
                 async def agent_to_browser():
                     nonlocal pending_user_text
@@ -404,25 +421,58 @@ async def voice_stream(request):
                             })
                             schedule_latency_if_complete()
                         elif event_type in {"Warning", "Error"}:
+                            detail = (
+                                event.get("description")
+                                or event.get("message")
+                                or "Deepgram Voice Agent hatası."
+                            )
+                            print(
+                                f"Voice Agent {event_type}:",
+                                f"code={event.get('code')}",
+                                detail,
+                            )
                             await ws.send_json({
                                 "type": event_type.lower(),
-                                "message": event.get("description")
-                                or event.get("message")
-                                or "Deepgram Voice Agent hatası.",
+                                "message": detail,
                             })
                             if event_type == "Error":
                                 break
+                    print(
+                        "Voice stream Deepgram okuma döngüsü bitti:",
+                        f"closed={agent_ws.closed}",
+                        f"close_code={agent_ws.close_code}",
+                        f"exception={agent_ws.exception()!r}",
+                    )
 
-                tasks = {
-                    asyncio.create_task(browser_to_agent()),
-                    asyncio.create_task(agent_to_browser()),
-                }
+                browser_task = asyncio.create_task(
+                    browser_to_agent(), name="voice-browser-to-agent"
+                )
+                agent_task = asyncio.create_task(
+                    agent_to_browser(), name="voice-agent-to-browser"
+                )
+                keepalive_task = asyncio.create_task(
+                    keep_agent_alive(), name="voice-agent-keepalive"
+                )
+                tasks = {browser_task, agent_task}
                 done, pending = await asyncio.wait(
                     tasks, return_when=asyncio.FIRST_COMPLETED
                 )
-                for task in pending:
+                completed_names = ", ".join(
+                    task.get_name() for task in done
+                )
+                print(
+                    "Voice stream kapanışı başlatıldı:",
+                    f"tamamlanan={completed_names}",
+                    f"browser_closed={ws.closed}",
+                    f"agent_closed={agent_ws.closed}",
+                )
+                for task in pending | {keepalive_task}:
                     task.cancel()
-                await asyncio.gather(*pending, return_exceptions=True)
+                await asyncio.gather(
+                    *pending,
+                    keepalive_task,
+                    return_exceptions=True,
+                )
                 for task in done:
                     task.result()
                 if persistence_tasks:
