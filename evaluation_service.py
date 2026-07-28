@@ -16,7 +16,11 @@ from database import (
 
 
 DEEPGRAM_API_KEY = os.environ.get("DEEPGRAM_API_KEY", "")
-EVALUATION_MODEL = "gemini-3.1-flash-lite"
+EVALUATION_MODEL = os.environ.get(
+    "VOICE_EVALUATION_MODEL",
+    # QA gibi uzun ve yapılandırılmış çıktı işlerinde kararlı managed model.
+    "gemini-2.5-flash",
+)
 
 CRITERIA = {
     "intent_understanding": "Kullanıcının niyetini doğru anlama",
@@ -194,8 +198,14 @@ async def _call_deepgram_evaluator(payload):
                 ):
                     return _extract_json(event.get("content"))
                 elif event_type == "Error":
+                    detail = (
+                        event.get("description")
+                        or event.get("message")
+                        or "Deepgram evaluator hatası."
+                    )
+                    code = event.get("code")
                     raise RuntimeError(
-                        event.get("description") or "Deepgram evaluator hatası."
+                        f"{detail}{f' (code={code})' if code else ''}"
                     )
     raise RuntimeError("Değerlendirme agentından cevap alınamadı.")
 
@@ -203,7 +213,10 @@ async def _call_deepgram_evaluator(payload):
 async def evaluate_voice_session(session_id, recording_id):
     try:
         await asyncio.to_thread(
-            start_voice_ai_evaluation, session_id, recording_id
+            start_voice_ai_evaluation,
+            session_id,
+            recording_id,
+            EVALUATION_MODEL,
         )
         transcript = await asyncio.to_thread(
             get_session_transcript, session_id, 100
@@ -224,17 +237,25 @@ async def evaluate_voice_session(session_id, recording_id):
             200,
             session_id,
         )
+        # QA agentına yalnızca son 20 turu gönder. Tüm performans trend
+        # noktalarını ve yüzlerce eski turu göndermek managed LLM bağlamını
+        # gereksiz büyütüp think çağrısının reddedilmesine yol açabiliyor.
         turns = [
             {
                 "user": row.get("user_message"),
                 "assistant": row.get("bot_response"),
             }
-            for row in transcript
+            for row in transcript[-20:]
         ]
+        performance_summary = {
+            key: value
+            for key, value in performance.items()
+            if not key.startswith("_")
+        }
         raw_result = await _call_deepgram_evaluator({
             "criteria": CRITERIA,
             "transcript": turns,
-            "performance_metrics_ms": performance,
+            "performance_metrics_ms": performance_summary,
         })
         result = _validate_result(raw_result)
         await asyncio.to_thread(
