@@ -1,0 +1,232 @@
+import asyncio
+import json
+import os
+import re
+
+import aiohttp
+
+from database import (
+    complete_voice_ai_evaluation,
+    fail_voice_ai_evaluation,
+    get_performance_metrics_averages,
+    get_session_transcript,
+    start_voice_ai_evaluation,
+)
+
+
+DEEPGRAM_API_KEY = os.environ.get("DEEPGRAM_API_KEY", "")
+EVALUATION_MODEL = "gemini-3.1-flash-lite"
+
+CRITERIA = {
+    "intent_understanding": "Kullanıcının niyetini doğru anlama",
+    "answer_relevance": "Cevabın soruyla doğrudan ilgili olması",
+    "accuracy": "Olgusal doğruluk ve halüsinasyondan kaçınma",
+    "naturalness": "Türkçe konuşmanın doğallığı",
+    "conciseness": "Gereksiz tekrar ve uzunluktan kaçınma",
+    "task_completion": "Kullanıcının hedefini tamamlama",
+    "context_retention": "Önceki konuşma bağlamını doğru kullanma",
+    "barge_in_handling": "Kesilme sonrası yeni isteğe odaklanma",
+    "tool_usage": "Araç kullanımının gerekliliği ve doğruluğu",
+    "safety": "Güvenli, şeffaf ve uygun yanıt verme",
+}
+
+EVALUATOR_PROMPT = """
+Sen CineMatch Voice Agent görüşmelerini denetleyen bağımsız QA agentısın.
+Sana verilen transkripti ve performans özetini yalnızca kanıta dayanarak
+değerlendir. Her kriteri 0-10 arasında puanla. Transkriptte gözlenemeyen bir
+kriter için score=null ve observed=false kullan; veri uydurma.
+
+Yalnızca geçerli JSON döndür. Markdown veya açıklama ekleme. Şema:
+{
+  "overall_score": 0-100,
+  "summary": "kısa yönetici özeti",
+  "criteria": {
+    "<criterion>": {
+      "score": 0-10 veya null,
+      "observed": true veya false,
+      "reason": "kanıta dayalı kısa gerekçe"
+    }
+  },
+  "issues": [
+    {
+      "type": "snake_case",
+      "severity": "low|medium|high|critical",
+      "evidence": "transkriptten kısa kanıt",
+      "recommendation": "somut düzeltme"
+    }
+  ],
+  "strengths": ["kanıta dayalı güçlü yön"],
+  "prompt_recommendations": [
+    {
+      "priority": "low|medium|high",
+      "problem": "tespit edilen tekrar eden veya önemli sorun",
+      "suggested_instruction": "sistem promptuna eklenebilecek net talimat",
+      "expected_effect": "beklenen sonuç",
+      "evidence": "bu görüşmedeki dayanak"
+    }
+  ]
+}
+
+Prompt önerisi yalnızca transkriptte gerçek bir problem varsa üret. Sistem
+promptunu otomatik değiştirme. Barge-in ve tool kullanımı transkriptten
+gözlenemiyorsa bunları puanlama.
+""".strip()
+
+
+def _extract_json(text):
+    clean = str(text or "").strip()
+    clean = re.sub(r"^```(?:json)?\s*", "", clean, flags=re.IGNORECASE)
+    clean = re.sub(r"\s*```$", "", clean)
+    start = clean.find("{")
+    end = clean.rfind("}")
+    if start < 0 or end <= start:
+        raise ValueError("Değerlendirme agentı geçerli JSON döndürmedi.")
+    return json.loads(clean[start:end + 1])
+
+
+def _validate_result(result):
+    if not isinstance(result, dict):
+        raise ValueError("Değerlendirme sonucu nesne değil.")
+    overall = result.get("overall_score")
+    if not isinstance(overall, (int, float)) or not 0 <= overall <= 100:
+        raise ValueError("overall_score 0-100 aralığında değil.")
+    criteria = result.get("criteria")
+    if not isinstance(criteria, dict):
+        raise ValueError("criteria alanı eksik.")
+    normalized = {}
+    for key in CRITERIA:
+        item = criteria.get(key) or {}
+        score = item.get("score")
+        observed = item.get("observed") is True
+        if not observed:
+            score = None
+        elif not isinstance(score, (int, float)) or not 0 <= score <= 10:
+            raise ValueError(f"{key} puanı geçersiz.")
+        normalized[key] = {
+            "label": CRITERIA[key],
+            "score": score,
+            "observed": observed,
+            "reason": str(item.get("reason") or "")[:600],
+        }
+    result["criteria"] = normalized
+    result["summary"] = str(result.get("summary") or "")[:2000]
+    result["issues"] = list(result.get("issues") or [])[:20]
+    result["strengths"] = list(result.get("strengths") or [])[:20]
+    result["prompt_recommendations"] = list(
+        result.get("prompt_recommendations") or []
+    )[:15]
+    return result
+
+
+async def _call_deepgram_evaluator(payload):
+    if not DEEPGRAM_API_KEY:
+        raise RuntimeError("DEEPGRAM_API_KEY tanımlı değil.")
+
+    settings = {
+        "type": "Settings",
+        "tags": ["cinematch", "qa-evaluator"],
+        "audio": {
+            "input": {"encoding": "linear16", "sample_rate": 16000},
+            "output": {
+                "encoding": "linear16",
+                "sample_rate": 24000,
+                "container": "none",
+            },
+        },
+        "agent": {
+            "language": "tr",
+            "listen": {
+                "provider": {
+                    "type": "deepgram",
+                    "model": "nova-3",
+                    "language": "tr",
+                }
+            },
+            "think": {
+                "provider": {
+                    "type": "google",
+                    "model": EVALUATION_MODEL,
+                    "temperature": 0.1,
+                },
+                "prompt": EVALUATOR_PROMPT,
+            },
+            "speak": {
+                "provider": {
+                    "type": "deepgram",
+                    "model": "aura-2-thalia-en",
+                }
+            },
+        },
+    }
+
+    timeout = aiohttp.ClientTimeout(total=90)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.ws_connect(
+            "wss://agent.deepgram.com/v1/agent/converse",
+            headers={"Authorization": f"Token {DEEPGRAM_API_KEY}"},
+            heartbeat=20,
+        ) as ws:
+            async for message in ws:
+                if message.type != aiohttp.WSMsgType.TEXT:
+                    continue
+                event = json.loads(message.data)
+                event_type = event.get("type")
+                if event_type == "Welcome":
+                    await ws.send_json(settings)
+                elif event_type == "SettingsApplied":
+                    await ws.send_json({
+                        "type": "InjectUserMessage",
+                        "content": json.dumps(payload, ensure_ascii=False),
+                    })
+                elif (
+                    event_type == "ConversationText"
+                    and event.get("role") == "assistant"
+                ):
+                    return _extract_json(event.get("content"))
+                elif event_type == "Error":
+                    raise RuntimeError(
+                        event.get("description") or "Deepgram evaluator hatası."
+                    )
+    raise RuntimeError("Değerlendirme agentından cevap alınamadı.")
+
+
+async def evaluate_voice_session(session_id, recording_id):
+    try:
+        await asyncio.to_thread(
+            start_voice_ai_evaluation, session_id, recording_id
+        )
+        transcript = await asyncio.to_thread(
+            get_session_transcript, session_id, 100
+        )
+        if not transcript:
+            raise RuntimeError("Değerlendirilecek transkript bulunamadı.")
+        performance = await asyncio.to_thread(
+            get_performance_metrics_averages,
+            200,
+            session_id,
+        )
+        turns = [
+            {
+                "user": row.get("user_message"),
+                "assistant": row.get("bot_response"),
+            }
+            for row in transcript
+        ]
+        raw_result = await _call_deepgram_evaluator({
+            "criteria": CRITERIA,
+            "transcript": turns,
+            "performance_metrics_ms": performance,
+        })
+        result = _validate_result(raw_result)
+        await asyncio.to_thread(
+            complete_voice_ai_evaluation, recording_id, result
+        )
+        print("Voice AI değerlendirmesi tamamlandı:", recording_id)
+    except Exception as exc:
+        print("Voice AI değerlendirme hatası:", repr(exc))
+        try:
+            await asyncio.to_thread(
+                fail_voice_ai_evaluation, recording_id, exc
+            )
+        except Exception as persist_exc:
+            print("Değerlendirme hata kaydı yazılamadı:", repr(persist_exc))

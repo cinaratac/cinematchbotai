@@ -58,6 +58,7 @@ COL_API_LOGS = "bot_api_logs"
 COL_EVALUATIONS = "bot_evaluations"
 COL_PERFORMANCE_METRICS = "bot_performance_metrics"
 COL_VOICE_RECORDINGS = "bot_voice_recordings"
+COL_VOICE_AI_EVALUATIONS = "bot_voice_ai_evaluations"
 
 
 def _now():
@@ -346,6 +347,63 @@ def get_voice_recording_download_url(recording_id, track):
             f'attachment; filename="{recording_id}-{track}.wav"'
         ),
     )
+
+
+def start_voice_ai_evaluation(session_id, recording_id):
+    ref = _get_db().collection(COL_VOICE_AI_EVALUATIONS).document(recording_id)
+    ref.set({
+        "session_id": session_id,
+        "recording_id": recording_id,
+        "status": "processing",
+        "model": "deepgram-managed/google/gemini-3.1-flash-lite",
+        "created_at": _now(),
+        "updated_at": _now(),
+    })
+
+
+def complete_voice_ai_evaluation(recording_id, result):
+    payload = dict(result)
+    payload.update({
+        "status": "completed",
+        "updated_at": _now(),
+    })
+    _get_db().collection(COL_VOICE_AI_EVALUATIONS).document(
+        recording_id
+    ).update(payload)
+
+
+def fail_voice_ai_evaluation(recording_id, error):
+    _get_db().collection(COL_VOICE_AI_EVALUATIONS).document(
+        recording_id
+    ).set({
+        "recording_id": recording_id,
+        "status": "failed",
+        "error": str(error)[:1000],
+        "updated_at": _now(),
+    }, merge=True)
+
+
+def get_voice_ai_evaluations_admin(session_id):
+    docs = list(
+        _get_db().collection(COL_VOICE_AI_EVALUATIONS)
+        .where(filter=FieldFilter("session_id", "==", session_id))
+        .stream()
+    )
+    docs.sort(
+        key=lambda d: (
+            d.to_dict().get("created_at").timestamp()
+            if isinstance(d.to_dict().get("created_at"), datetime)
+            else 0
+        ),
+        reverse=True,
+    )
+    rows = []
+    for doc in docs:
+        data = doc.to_dict()
+        data["created_at"] = _iso(data.get("created_at"))
+        data["updated_at"] = _iso(data.get("updated_at"))
+        rows.append({"id": doc.id, **data})
+    return rows
 
 
 def get_session_transcript(session_id, limit=50):
@@ -729,6 +787,7 @@ def get_session_admin_detail(session_id):
         session_id=session_id,
     )
     voice_recordings = get_voice_recordings_admin(session_id)
+    voice_ai_evaluations = get_voice_ai_evaluations_admin(session_id)
 
     return {
         "session": session,
@@ -739,6 +798,7 @@ def get_session_admin_detail(session_id):
         "performance_metrics": performance_metrics,
         "performance_averages": performance_averages,
         "voice_recordings": voice_recordings,
+        "voice_ai_evaluations": voice_ai_evaluations,
     }
 
 
