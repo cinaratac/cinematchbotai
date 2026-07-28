@@ -108,13 +108,16 @@ def _criterion_function_schema():
         "type": "object",
         "properties": {
             "score": {
-                "type": "number",
+                "anyOf": [
+                    {"type": "number"},
+                    {"type": "null"},
+                ],
                 "description": "Gözlenebiliyorsa 0-10 puan.",
             },
             "observed": {"type": "boolean"},
             "reason": {"type": "string"},
         },
-        "required": ["observed", "reason"],
+        "required": ["score", "observed", "reason"],
     }
 
 
@@ -239,15 +242,32 @@ def _validate_result(result):
     criteria = result.get("criteria")
     if not isinstance(criteria, dict):
         raise ValueError("criteria alanı eksik.")
+    comparison = result.get("transcript_comparison") or {}
+    match_score = comparison.get("match_score")
+    if not isinstance(match_score, (int, float)):
+        raise ValueError("transcript_comparison.match_score eksik.")
+    comparison["match_score"] = max(0, min(100, match_score))
+    comparison["summary"] = str(comparison.get("summary") or "")[:2000]
+    comparison["mismatches"] = list(
+        comparison.get("mismatches") or []
+    )[:30]
+    result["transcript_comparison"] = comparison
     normalized = {}
     for key in CRITERIA:
         item = criteria.get(key) or {}
         score = item.get("score")
         observed = item.get("observed") is True
+        if key == "speech_recognition_accuracy":
+            # Bu kriterin nesnel kaynağı iki transkriptin eşleşme yüzdesidir.
+            # LLM score alanını atlasa bile tüm raporu kaybetme.
+            score = round(comparison["match_score"] / 10, 1)
+            observed = True
         if not observed:
             score = None
         elif not isinstance(score, (int, float)) or not 0 <= score <= 10:
-            raise ValueError(f"{key} puanı geçersiz.")
+            # Tek bir eksik opsiyonel kriter tüm değerlendirmeyi bozmasın.
+            score = None
+            observed = False
         normalized[key] = {
             "label": CRITERIA[key],
             "score": score,
@@ -261,16 +281,6 @@ def _validate_result(result):
     result["prompt_recommendations"] = list(
         result.get("prompt_recommendations") or []
     )[:15]
-    comparison = result.get("transcript_comparison") or {}
-    match_score = comparison.get("match_score")
-    if not isinstance(match_score, (int, float)):
-        raise ValueError("transcript_comparison.match_score eksik.")
-    comparison["match_score"] = max(0, min(100, match_score))
-    comparison["summary"] = str(comparison.get("summary") or "")[:2000]
-    comparison["mismatches"] = list(
-        comparison.get("mismatches") or []
-    )[:30]
-    result["transcript_comparison"] = comparison
     # Model, diğer kriterler iyi diye ciddi STT hatalarını örtemesin.
     # Ses-transkript eşleşmesi düşükse toplam kalite puanına deterministik tavan koy.
     if comparison["match_score"] < 60:
@@ -461,8 +471,9 @@ async def _call_deepgram_evaluator(payload, provider_type, model):
 
 async def evaluate_voice_session(session_id, recording_id):
     provider_chain = [
-        ("google", EVALUATION_MODEL),
-        # Bu OpenRouter değildir; Deepgram'ın yönettiği standart fallback'tir.
+        # Deepgram managed Google adapter'ı InjectUserMessage + function
+        # kullanımında boş contents ürettiği için 400 dönüyor. Bu OpenRouter
+        # değildir; Deepgram'ın yönettiği OpenAI think sağlayıcısıdır.
         ("open_ai", "gpt-4o-mini"),
     ]
     try:
