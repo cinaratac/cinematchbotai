@@ -10,6 +10,7 @@ from database import (
     fail_voice_ai_evaluation,
     get_performance_metrics_averages,
     get_session_transcript,
+    skip_voice_ai_evaluation,
     start_voice_ai_evaluation,
 )
 
@@ -152,8 +153,17 @@ async def _call_deepgram_evaluator(payload):
             },
             "speak": {
                 "provider": {
-                    "type": "deepgram",
-                    "model": "aura-2-thalia-en",
+                    # QA sonucu metin olarak alınır ve ses paketleri kullanılmaz.
+                    # Agent API yine de bir speak sağlayıcısı istediği için ana
+                    # voice agentta çalışan Türkçe Cartesia ayarı kullanılır.
+                    "type": "cartesia",
+                    "model_id": "sonic-3",
+                    "voice": {
+                        "mode": "id",
+                        "id": "a167e0f3-df7e-4d52-a9c3-f949145efdab",
+                    },
+                    "language": "tr",
+                    "speed": "normal",
                 }
             },
         },
@@ -199,7 +209,16 @@ async def evaluate_voice_session(session_id, recording_id):
             get_session_transcript, session_id, 100
         )
         if not transcript:
-            raise RuntimeError("Değerlendirilecek transkript bulunamadı.")
+            await asyncio.to_thread(
+                skip_voice_ai_evaluation,
+                recording_id,
+                "Görüşmede değerlendirilecek transkript oluşmadı.",
+            )
+            print(
+                "Voice AI değerlendirmesi atlandı; transkript yok:",
+                recording_id,
+            )
+            return
         performance = await asyncio.to_thread(
             get_performance_metrics_averages,
             200,

@@ -383,6 +383,18 @@ def fail_voice_ai_evaluation(recording_id, error):
     }, merge=True)
 
 
+def skip_voice_ai_evaluation(recording_id, reason):
+    _get_db().collection(COL_VOICE_AI_EVALUATIONS).document(
+        recording_id
+    ).set({
+        "recording_id": recording_id,
+        "status": "skipped",
+        "error": None,
+        "skip_reason": str(reason)[:1000],
+        "updated_at": _now(),
+    }, merge=True)
+
+
 def get_voice_ai_evaluations_admin(session_id):
     docs = list(
         _get_db().collection(COL_VOICE_AI_EVALUATIONS)
