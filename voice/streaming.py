@@ -222,6 +222,15 @@ async def voice_stream(request):
                         session_id=session_id,
                         deepgram_request_id=deepgram_request_id,
                         turn_number=turn_number,
+                        recording_id=(
+                            recording.recording_id if recording else None
+                        ),
+                        barge_in_latency_ms=measured_latency_event.get(
+                            "barge_in_latency_ms"
+                        ),
+                        interrupt_count=measured_latency_event.get(
+                            "interrupt_count", 0
+                        ),
                     )
                     await asyncio.to_thread(log_performance_metric, metric)
 
@@ -264,11 +273,15 @@ async def voice_stream(request):
                             if command.get("type") == "keepalive":
                                 await agent_ws.send_json({"type": "KeepAlive"})
                             elif command.get("type") == "interrupt":
-                                barge_in.drop_interrupted_audio = True
-                                barge_in.interrupted_user_committed = False
-                                barge_in.client_interrupt_started = time.perf_counter()
+                                accepted = barge_in.record_interrupt(
+                                    "client"
+                                )
                                 await ws.send_json({
-                                    "type": "interrupt_acknowledged"
+                                    "type": "interrupt_acknowledged",
+                                    "accepted": accepted,
+                                    "interrupt_count": (
+                                        barge_in.total_interrupts_this_session
+                                    ),
                                 })
                             elif command.get("type") == "playback_done":
                                 # Tarayıcıdaki son ses buffer'ı gerçekten
@@ -356,8 +369,11 @@ async def voice_stream(request):
                                 # turuna ait assistant metni kesinleştiğinde ses
                                 # kapısını mutlaka yeniden aç.
                                 barge_in.drop_interrupted_audio = False
-                                barge_in.interrupted_user_committed = False
-                                barge_in.client_interrupt_started = None
+                                latency_ms = barge_in.record_resume()
+                                if latency_ms is not None:
+                                    latency_event[
+                                        "barge_in_latency_ms"
+                                    ] = latency_ms
                                 await ws.send_json({"type": "speaking"})
                             await ws.send_json({
                                 "type": "transcript",
@@ -372,7 +388,7 @@ async def voice_stream(request):
                                 first_audio_at = None
                                 audio_done_at = None
                                 if barge_in.drop_interrupted_audio:
-                                    barge_in.interrupted_user_committed = True
+                                    barge_in.record_user_committed()
                             elif role == "assistant" and pending_user_text:
                                 if assistant_text_ready_at is None:
                                     assistant_text_ready_at = time.perf_counter()
@@ -386,13 +402,18 @@ async def voice_stream(request):
                                     track_persistence_task
                                 )
                         elif event_type == "UserStartedSpeaking":
+                            accepted = barge_in.record_interrupt(
+                                "deepgram_vad"
+                            )
                             latency_event = {}
+                            latency_event["interrupt_count"] = (
+                                barge_in.total_interrupts_this_session
+                            )
                             turn_metric_logged = False
                             first_audio_at = None
                             audio_done_at = None
                             user_transcript_ready_at = None
                             assistant_text_ready_at = None
-                            barge_in.drop_interrupted_audio = True
                             barge_in.interrupted_user_committed = bool(pending_user_text)
                             await ws.send_json({"type": "interrupt"})
                         elif event_type == "AgentThinking":
@@ -415,11 +436,17 @@ async def voice_stream(request):
                                 and user_transcript_ready_at is not None
                             ):
                                 assistant_text_ready_at = time.perf_counter()
-                            barge_in.client_interrupt_started = None
-                            barge_in.drop_interrupted_audio = False
-                            barge_in.interrupted_user_committed = False
+                            latency_ms = barge_in.record_resume()
+                            if latency_ms is not None:
+                                latency_event[
+                                    "barge_in_latency_ms"
+                                ] = latency_ms
+                            latency_event["interrupt_count"] = (
+                                barge_in.total_interrupts_this_session
+                            )
                             await ws.send_json({"type": "speaking"})
                         elif event_type == "AgentAudioDone":
+                            barge_in.record_agent_done()
                             await ws.send_json({"type": "audio_done"})
                         elif event_type == "LatencyReport":
                             latency_event.update({

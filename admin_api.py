@@ -21,7 +21,7 @@ import os
 import secrets
 from functools import wraps
 
-from flask import Blueprint, jsonify, redirect, request
+from flask import Blueprint, jsonify, redirect, render_template, request
 
 import database as db
 
@@ -92,6 +92,25 @@ def overview():
 
     data = db.get_admin_overview(days=days)
     return jsonify({"status": "success", "data": data}), 200
+
+
+@admin_bp.route("/voice-qa/dashboard", methods=["GET"])
+@require_admin_key
+def voice_qa_dashboard():
+    try:
+        days = int(request.args.get("days", 14))
+    except (TypeError, ValueError):
+        days = 14
+    days = max(1, min(days, 90))
+    session_id = request.args.get("session_id") or None
+    dashboard = db.get_voice_qa_trend(
+        days=days,
+        session_id=session_id,
+    )
+    return render_template(
+        "voice_qa_dashboard.html",
+        dashboard=dashboard,
+    )
 
 
 @admin_bp.route("/sessions", methods=["GET"])

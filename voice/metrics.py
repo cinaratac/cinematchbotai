@@ -15,6 +15,9 @@ def build_voice_metric(
     session_id,
     deepgram_request_id,
     turn_number,
+    recording_id=None,
+    barge_in_latency_ms=None,
+    interrupt_count=0,
 ):
     """Deepgram raporu ve client playback zamanından Firestore metriği üretir."""
     ai_ms = _milliseconds(latency_event, "ttt_text_latency")
@@ -38,13 +41,16 @@ def build_voice_metric(
     return {
         "channel": "voice_websocket",
         "input_type": "streaming_audio",
-        "metric_version": 4,
+        "metric_version": 5,
         "measurement_definition": "deepgram_e2e_first_audio",
         "user_id": user_id,
         "username": username,
         "session_id": session_id,
         "deepgram_request_id": deepgram_request_id,
         "turn_number": turn_number,
+        "recording_id": recording_id,
+        "barge_in_latency_ms": barge_in_latency_ms,
+        "interrupt_count": interrupt_count,
         "asr_ms": asr_ms,
         "asr_is_estimate": True,
         "ai_ms": ai_ms,

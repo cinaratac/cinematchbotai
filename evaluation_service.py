@@ -21,10 +21,15 @@ from voice.activity import wait_for_voice_idle
 
 DEEPGRAM_API_KEY = os.environ.get("DEEPGRAM_API_KEY", "")
 EVALUATION_MODEL = os.environ.get(
-    "VOICE_EVALUATION_MODEL",
-    # QA gibi uzun ve yapılandırılmış çıktı işlerinde kararlı managed model.
-    "gemini-2.5-flash",
+    "VOICE_EVALUATION_MODEL", "gpt-4o-mini"
 )
+if not EVALUATION_MODEL.startswith("gpt-"):
+    print(
+        "VOICE_EVALUATION_MODEL open_ai sağlayıcısıyla uyumsuz; "
+        "gpt-4o-mini kullanılacak:",
+        EVALUATION_MODEL,
+    )
+    EVALUATION_MODEL = "gpt-4o-mini"
 EVALUATION_TASKS = set()
 
 CRITERIA = {
@@ -53,6 +58,13 @@ gerçekte söylenenlere uygunluğunu değerlendir. Her kriteri 0-10 arasında
 puanla. Gözlenemeyen kriter için score=null ve observed=false kullan.
 Veri uydurma. Belirgin konuşma tanıma hataları varsa bunları issue olarak
 raporla ve overall_score değerini gereksiz şekilde yüksek verme.
+
+İki transkript arasındaki yalnızca yazım, noktalama, ek, çekim veya aynı anlamı
+taşıyan eş anlamlı ifade farklarını speech_recognition_error sayma. Örneğin
+"iletişime geçmek" ve "iletişim kurmak" tek başına anlam kaybı değildir.
+Hata ancak kullanıcının niyeti, varlık adı, sayı, olumsuzluk, tercih veya
+cevabın yönü değişiyorsa raporlanmalıdır. Kanıt alanında iki taraftaki gerçek
+ifadeyi aynen göster; transkriptte bulunmayan örnek uydurma.
 
 Sonucu serbest metin olarak yazma. Daima submit_evaluation fonksiyonunu çağır.
 Fonksiyon argümanlarını aşağıdaki şemaya göre doldur:
@@ -94,12 +106,28 @@ Fonksiyon argümanlarını aşağıdaki şemaya göre doldur:
         "impact": "yanlış anlamanın cevaba etkisi"
       }
     ]
-  }
+  },
+  "turns": [
+    {
+      "turn_index": 1,
+      "notable": true,
+      "issues": ["bu tura özgü kanıta dayalı sorun"]
+    }
+  ]
 }
 
 Prompt önerisi yalnızca transkriptte gerçek bir problem varsa üret. Sistem
 promptunu otomatik değiştirme. Barge-in ve tool kullanımı transkriptten
-gözlenemiyorsa bunları puanlama.
+gözlenemiyorsa bunları puanlama. "Daha fazla eğitim verisi kullan", "modeli
+eğit" veya "STT sistemini güncelle" gibi bu uygulamada doğrudan yapılamayan
+genel öneriler verme. Öneriler yalnızca sistem promptuna eklenecek somut bir
+talimat veya değiştirilebilecek voice/STT konfigürasyonu olmalıdır. Sorun
+prompt ile düzeltilemezse prompt_recommendations alanına ekleme; issues içinde
+teknik konfigürasyon önerisi olarak belirt.
+Her logged_transcript turu için aynı turn_index ile turns dizisinde bir kayıt
+oluştur. Sorunsuz turda issues boş liste ve notable=false olmalıdır.
+Barge-in metriği varsa barge_in_handling kriterini bu ölçüme dayanarak puanla;
+yoksa gözlenemedi olarak bırak.
 """.strip()
 
 
@@ -208,6 +236,21 @@ EVALUATION_FUNCTION = {
                 },
                 "required": ["match_score", "summary", "mismatches"],
             },
+            "turns": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "turn_index": {"type": "number"},
+                        "notable": {"type": "boolean"},
+                        "issues": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                    },
+                    "required": ["turn_index", "notable", "issues"],
+                },
+            },
         },
         "required": [
             "overall_score",
@@ -217,6 +260,7 @@ EVALUATION_FUNCTION = {
             "strengths",
             "prompt_recommendations",
             "transcript_comparison",
+            "turns",
         ],
     },
 }
@@ -281,6 +325,7 @@ def _validate_result(result):
     result["prompt_recommendations"] = list(
         result.get("prompt_recommendations") or []
     )[:15]
+    result["turns"] = list(result.get("turns") or [])[:50]
     # Model, diğer kriterler iyi diye ciddi STT hatalarını örtemesin.
     # Ses-transkript eşleşmesi düşükse toplam kalite puanına deterministik tavan koy.
     if comparison["match_score"] < 60:
@@ -344,7 +389,7 @@ async def _transcribe_recording(recording_id):
     return transcript
 
 
-async def _call_deepgram_evaluator(payload, provider_type, model):
+async def _call_deepgram_evaluator_once(payload, provider_type, model):
     if not DEEPGRAM_API_KEY:
         raise RuntimeError("DEEPGRAM_API_KEY tanımlı değil.")
 
@@ -469,13 +514,56 @@ async def _call_deepgram_evaluator(payload, provider_type, model):
     raise RuntimeError("Değerlendirme agentından cevap alınamadı.")
 
 
+async def _call_deepgram_evaluator(payload, provider_type, model, attempts=3):
+    """Geçici WS/provider hatalarında üstel geri çekilmeli yeniden deneme."""
+    errors = []
+    for attempt in range(1, attempts + 1):
+        try:
+            return await _call_deepgram_evaluator_once(
+                payload, provider_type, model
+            )
+        except (aiohttp.ClientError, asyncio.TimeoutError, RuntimeError) as exc:
+            errors.append(str(exc))
+            detail = str(exc).lower()
+            transient = (
+                isinstance(exc, (aiohttp.ClientError, asyncio.TimeoutError))
+                or any(marker in detail for marker in (
+                    "timeout",
+                    "timed out",
+                    "internal_server_error",
+                    "failed_to_think",
+                    "connection",
+                    "disconnect",
+                    "502",
+                    "503",
+                    "504",
+                ))
+            )
+            if not transient:
+                raise
+            if attempt >= attempts:
+                break
+            delay = 2 ** (attempt - 1)
+            print(
+                "Voice QA geçici hata; yeniden denenecek:",
+                f"attempt={attempt}/{attempts}",
+                f"delay={delay}s",
+                repr(exc),
+            )
+            await asyncio.sleep(delay)
+    raise RuntimeError(
+        f"QA {attempts} denemede tamamlanamadı: " + " | ".join(errors)
+    )
+
+
 async def evaluate_voice_session(session_id, recording_id):
-    provider_chain = [
+    provider_chain = list(dict.fromkeys([
         # Deepgram managed Google adapter'ı InjectUserMessage + function
         # kullanımında boş contents ürettiği için 400 dönüyor. Bu OpenRouter
         # değildir; Deepgram'ın yönettiği OpenAI think sağlayıcısıdır.
-        ("open_ai", "gpt-4o-mini"),
-    ]
+        ("open_ai", EVALUATION_MODEL),
+        ("open_ai", "gpt-4o"),
+    ]))
     try:
         print(
             "Voice AI değerlendirmesi canlı görüşmelerin bitmesini bekliyor:",
@@ -515,16 +603,18 @@ async def evaluate_voice_session(session_id, recording_id):
             get_performance_metrics_averages,
             200,
             session_id,
+            recording_id,
         )
         # QA agentına yalnızca son 20 turu gönder. Tüm performans trend
         # noktalarını ve yüzlerce eski turu göndermek managed LLM bağlamını
         # gereksiz büyütüp think çağrısının reddedilmesine yol açabiliyor.
         turns = [
             {
+                "turn_index": index,
                 "user": row.get("user_message"),
                 "assistant": row.get("bot_response"),
             }
-            for row in transcript[-20:]
+            for index, row in enumerate(transcript[-20:], start=1)
         ]
         performance_summary = {
             key: value
@@ -536,6 +626,14 @@ async def evaluate_voice_session(session_id, recording_id):
             "audio_transcript": audio_transcript,
             "logged_transcript": turns,
             "performance_metrics_ms": performance_summary,
+            "barge_in_metrics": {
+                "average_latency_ms": performance_summary.get(
+                    "barge_in_latency_ms"
+                ),
+                "average_interrupt_count": performance_summary.get(
+                    "interrupt_count"
+                ),
+            },
         }
         provider_errors = []
         raw_result = None

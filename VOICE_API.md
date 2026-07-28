@@ -91,3 +91,21 @@ Bir web uygulamasına gömülen API anahtarı kullanıcı tarafından görülebi
 Üretimde web istemcileri için kısa ömürlü, backend tarafından verilen bir
 oturum tokenına geçilmesi; sabit `VOICE_API_KEY` kullanımının güvenilir sunucu
 veya kontrollü mobil istemcilerle sınırlandırılması gerekir.
+# Voice QA Dashboard
+
+Admin kalite dashboard'u son görüşmelerin QA skorlarını, ses-transkript
+eşleşmesini, kriter ortalamalarını, barge-in gecikmesini ve prompt aksiyonlarını
+server-render edilmiş HTML olarak gösterir.
+
+```bash
+curl \
+  "https://cinematchbotai.onrender.com/api/admin/voice-qa/dashboard?days=14" \
+  -H "X-Admin-Key: ADMIN_API_KEY" \
+  -o voice-qa-dashboard.html
+```
+
+Tek oturum filtresi:
+
+```text
+/api/admin/voice-qa/dashboard?days=30&session_id=OTURUM_ID
+```

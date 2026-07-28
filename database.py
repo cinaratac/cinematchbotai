@@ -79,6 +79,10 @@ def setup_database():
     try:
         _get_db()
         print("SİSTEM: Firestore bağlantısı hazır (bot_* koleksiyonları).")
+        try:
+            cleanup_stale_voice_ai_evaluations()
+        except Exception as cleanup_error:
+            print("Stale Voice QA temizleme uyarısı:", repr(cleanup_error))
     except Exception as e:
         print(f"SİSTEM HATASI: Firestore bağlantısı kurulamadı: {e}")
 
@@ -394,6 +398,8 @@ def complete_voice_ai_evaluation(recording_id, result):
     payload = dict(result)
     payload.update({
         "status": "completed",
+        "error": firestore.DELETE_FIELD,
+        "skip_reason": firestore.DELETE_FIELD,
         "updated_at": _now(),
     })
     _get_db().collection(COL_VOICE_AI_EVALUATIONS).document(
@@ -408,6 +414,18 @@ def fail_voice_ai_evaluation(recording_id, error):
         "recording_id": recording_id,
         "status": "failed",
         "error": str(error)[:1000],
+        # Aynı belge daha önce tamamlandıysa eski rapor ile yeni hata aynı
+        # admin kartında görünmesin.
+        "overall_score": firestore.DELETE_FIELD,
+        "summary": firestore.DELETE_FIELD,
+        "criteria": firestore.DELETE_FIELD,
+        "issues": firestore.DELETE_FIELD,
+        "strengths": firestore.DELETE_FIELD,
+        "prompt_recommendations": firestore.DELETE_FIELD,
+        "turns": firestore.DELETE_FIELD,
+        "transcript_comparison": firestore.DELETE_FIELD,
+        "audio_transcript": firestore.DELETE_FIELD,
+        "logged_user_transcript": firestore.DELETE_FIELD,
         "updated_at": _now(),
     }, merge=True)
 
@@ -422,6 +440,30 @@ def skip_voice_ai_evaluation(recording_id, reason):
         "skip_reason": str(reason)[:1000],
         "updated_at": _now(),
     }, merge=True)
+
+
+def cleanup_stale_voice_ai_evaluations(max_age_minutes=30):
+    """Restart sonrası processing durumunda kalmış QA işlerini kapatır."""
+    cutoff = _now() - timedelta(minutes=max_age_minutes)
+    docs = list(
+        _get_db().collection(COL_VOICE_AI_EVALUATIONS)
+        .where(filter=FieldFilter("status", "==", "processing"))
+        .stream()
+    )
+    cleaned = 0
+    for doc in docs:
+        data = doc.to_dict() or {}
+        updated_at = data.get("updated_at") or data.get("created_at")
+        if isinstance(updated_at, datetime) and updated_at < cutoff:
+            doc.reference.set({
+                "status": "failed",
+                "error": "Sunucu yeniden başladı veya QA işi zaman aşımına uğradı.",
+                "updated_at": _now(),
+            }, merge=True)
+            cleaned += 1
+    if cleaned:
+        print("Stale Voice QA kayıtları kapatıldı:", cleaned)
+    return cleaned
 
 
 def get_voice_ai_evaluations_admin(session_id):
@@ -445,6 +487,102 @@ def get_voice_ai_evaluations_admin(session_id):
         data["updated_at"] = _iso(data.get("updated_at"))
         rows.append({"id": doc.id, **data})
     return rows
+
+
+def get_voice_qa_trend(days=14, session_id=None, limit=500):
+    """Dashboard için QA skor, kriter, eşleşme ve barge-in trendini üretir."""
+    cutoff = _now() - timedelta(days=days)
+    query = _get_db().collection(COL_VOICE_AI_EVALUATIONS).where(
+        filter=FieldFilter("status", "==", "completed")
+    )
+    docs = list(query.limit(limit).stream())
+    rows = []
+    criterion_sums = {}
+    criterion_counts = {}
+    for doc in docs:
+        data = doc.to_dict() or {}
+        created_at = data.get("created_at")
+        if not isinstance(created_at, datetime) or created_at < cutoff:
+            continue
+        if session_id and data.get("session_id") != session_id:
+            continue
+        criteria = data.get("criteria") or {}
+        for key, item in criteria.items():
+            score = item.get("score") if isinstance(item, dict) else None
+            if isinstance(score, (int, float)):
+                criterion_sums[key] = criterion_sums.get(key, 0) + score
+                criterion_counts[key] = criterion_counts.get(key, 0) + 1
+        comparison = data.get("transcript_comparison") or {}
+        rows.append({
+            "id": doc.id,
+            "recording_id": data.get("recording_id") or doc.id,
+            "session_id": data.get("session_id"),
+            "created_at": _iso(created_at),
+            "overall_score": data.get("overall_score"),
+            "match_score": comparison.get("match_score"),
+            "summary": data.get("summary", ""),
+            "issues": data.get("issues") or [],
+            "prompt_recommendations": (
+                data.get("prompt_recommendations") or []
+            ),
+        })
+    rows.sort(key=lambda row: row["created_at"] or "")
+    criteria_averages = {
+        key: round(criterion_sums[key] / criterion_counts[key], 1)
+        for key in criterion_sums
+        if criterion_counts.get(key)
+    }
+    metrics = _get_performance_metric_docs(
+        session_id=session_id,
+        scan_limit=2000,
+    )
+    barge_in_latencies = []
+    for metric_doc in metrics:
+        data = metric_doc.to_dict() or {}
+        created_at = data.get("created_at")
+        latency = data.get("barge_in_latency_ms")
+        if (
+            isinstance(created_at, datetime)
+            and created_at >= cutoff
+            and isinstance(latency, (int, float))
+        ):
+            barge_in_latencies.append(latency)
+    recommendations = []
+    for row in reversed(rows):
+        for item in row["prompt_recommendations"]:
+            if not isinstance(item, dict):
+                continue
+            recommendations.append({
+                **item,
+                "recording_id": row["recording_id"],
+            })
+    priority_order = {"high": 0, "medium": 1, "low": 2}
+    recommendations.sort(
+        key=lambda item: priority_order.get(item.get("priority"), 3)
+    )
+    return {
+        "days": days,
+        "session_id": session_id,
+        "evaluations": list(reversed(rows)),
+        "series": rows,
+        "criteria_averages": criteria_averages,
+        "barge_in_latencies": barge_in_latencies,
+        "prompt_recommendations": recommendations[:30],
+        "average_overall_score": (
+            round(sum(
+                row["overall_score"] for row in rows
+                if isinstance(row["overall_score"], (int, float))
+            ) / len([
+                row for row in rows
+                if isinstance(row["overall_score"], (int, float))
+            ]), 1)
+            if any(
+                isinstance(row["overall_score"], (int, float))
+                for row in rows
+            )
+            else None
+        ),
+    }
 
 
 def get_recording_transcript(recording_id, limit=100):
@@ -909,11 +1047,16 @@ PERFORMANCE_METRIC_FIELDS = [
     "telegram_download_ms", "asr_ms", "ai_ms", "ai_ready_ms",
     "telegram_text_send_ms", "ttfb_ms", "tts_ms", "tts_ready_ms",
     "telegram_voice_upload_ms", "voice_audio_stream_ms", "tool_total_ms",
-    "ttfs_ms", "e2e_ms", "full_turn_ms",
+    "ttfs_ms", "e2e_ms", "full_turn_ms", "barge_in_latency_ms",
+    "interrupt_count",
 ]
 
 
-def _get_performance_metric_docs(session_id=None, scan_limit=None):
+def _get_performance_metric_docs(
+    session_id=None,
+    recording_id=None,
+    scan_limit=None,
+):
     """Performans belgelerini en yeniden eskiye getirir.
 
     Session filtresi Python tarafında sıralanır; böylece Firestore'da
@@ -921,6 +1064,21 @@ def _get_performance_metric_docs(session_id=None, scan_limit=None):
     """
     db = _get_db()
     collection = db.collection(COL_PERFORMANCE_METRICS)
+    if recording_id:
+        docs = list(
+            collection
+            .where(filter=FieldFilter("recording_id", "==", recording_id))
+            .stream()
+        )
+        docs.sort(
+            key=lambda d: (
+                d.to_dict().get("created_at").timestamp()
+                if isinstance(d.to_dict().get("created_at"), datetime)
+                else 0
+            ),
+            reverse=True,
+        )
+        return docs[:scan_limit] if scan_limit is not None else docs
     if session_id:
         docs = list(
             collection
@@ -978,7 +1136,11 @@ def count_performance_metrics_admin(session_id=None):
     return query.count().get()[0][0].value
 
 
-def get_performance_metrics_averages(sample_size=200, session_id=None):
+def get_performance_metrics_averages(
+    sample_size=200,
+    session_id=None,
+    recording_id=None,
+):
     """Aynı geçerli başarı kohortu üzerinden karşılaştırılabilir ortalamalar.
 
     AI, TTFB ve E2E alanları farklı belge kümelerinden hesaplanırsa E2E
@@ -988,6 +1150,7 @@ def get_performance_metrics_averages(sample_size=200, session_id=None):
     """
     docs = _get_performance_metric_docs(
         session_id=session_id,
+        recording_id=recording_id,
         # Hatalı/eksik kayıtları eledikten sonra da yeterli örnek kalabilsin.
         scan_limit=max(sample_size * 5, sample_size),
     )
@@ -1004,7 +1167,7 @@ def get_performance_metrics_averages(sample_size=200, session_id=None):
         e2e_ms = data.get("e2e_ms")
         voice_schema_valid = (
             data.get("channel") != "voice_websocket"
-            or data.get("metric_version") == 4
+            or data.get("metric_version") in {4, 5}
         )
         valid = (
             data.get("status") == "success"

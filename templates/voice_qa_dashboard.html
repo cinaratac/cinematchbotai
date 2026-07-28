@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>CineMatch Voice QA</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.9/dist/chart.umd.min.js"></script>
+  <style>
+    :root{color-scheme:dark;--bg:#090d18;--card:#12192a;--line:#26314a;--text:#eef2ff;--muted:#9aa6bf;--brand:#8b5cf6;--cyan:#22d3ee}
+    *{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at top,#17203a 0,var(--bg) 42%);color:var(--text);font:14px/1.5 Inter,system-ui,sans-serif}
+    main{max-width:1400px;margin:auto;padding:32px}.top{display:flex;justify-content:space-between;gap:20px;align-items:end;margin-bottom:24px}
+    h1,h2,p{margin-top:0}h1{font-size:30px;margin-bottom:6px}.muted{color:var(--muted)}
+    .filters{display:flex;gap:8px}input,button{border:1px solid var(--line);background:#0d1424;color:var(--text);padding:10px 12px;border-radius:9px}
+    button{background:var(--brand);border:0;cursor:pointer}.grid{display:grid;grid-template-columns:repeat(12,1fr);gap:16px}
+    .card{background:rgba(18,25,42,.94);border:1px solid var(--line);border-radius:16px;padding:18px;box-shadow:0 12px 40px #0004}
+    .stat{grid-column:span 3}.chart{grid-column:span 6;min-height:340px}.wide{grid-column:1/-1}
+    .value{font-size:30px;font-weight:800}.pill{display:inline-block;padding:3px 8px;border-radius:99px;background:#273453;color:#cbd5e1}
+    table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:11px;border-bottom:1px solid var(--line);vertical-align:top}th{color:var(--muted)}
+    .recommendation{padding:12px 0;border-bottom:1px solid var(--line)}.high{color:#fb7185}.medium{color:#fbbf24}.low{color:#34d399}
+    @media(max-width:900px){main{padding:18px}.stat,.chart{grid-column:1/-1}.top{align-items:stretch;flex-direction:column}.filters{flex-wrap:wrap}}
+  </style>
+</head>
+<body>
+<main>
+  <div class="top">
+    <div><h1>CineMatch Voice QA</h1><p class="muted">Ses kayıtları, transkript doğruluğu ve agent kalite trendleri</p></div>
+    <form class="filters" method="get">
+      <input name="days" type="number" min="1" max="90" value="{{ dashboard.days }}" aria-label="Gün">
+      <input name="session_id" value="{{ dashboard.session_id or '' }}" placeholder="Session ID (opsiyonel)">
+      <button type="submit">Filtrele</button>
+    </form>
+  </div>
+  <section class="grid">
+    <article class="card stat"><div class="muted">Ortalama kalite</div><div class="value">{{ dashboard.average_overall_score if dashboard.average_overall_score is not none else '–' }}{% if dashboard.average_overall_score is not none %}/100{% endif %}</div></article>
+    <article class="card stat"><div class="muted">Değerlendirme</div><div class="value">{{ dashboard.evaluations|length }}</div></article>
+    <article class="card stat"><div class="muted">Barge-in ölçümü</div><div class="value">{{ dashboard.barge_in_latencies|length }}</div></article>
+    <article class="card stat"><div class="muted">Aksiyon önerisi</div><div class="value">{{ dashboard.prompt_recommendations|length }}</div></article>
+    <article class="card chart"><h2>Kalite ve STT eşleşme trendi</h2><canvas id="trend"></canvas></article>
+    <article class="card chart"><h2>Kriter ortalamaları</h2><canvas id="criteria"></canvas></article>
+    <article class="card chart"><h2>Barge-in tepki süreleri</h2><canvas id="barge"></canvas></article>
+    <article class="card chart"><h2>Prompt aksiyonları</h2>
+      {% for item in dashboard.prompt_recommendations %}
+      <div class="recommendation"><strong class="{{ item.priority }}">{{ item.priority|upper }} — {{ item.problem }}</strong><div>{{ item.suggested_instruction }}</div><small class="muted">{{ item.evidence }}</small></div>
+      {% else %}<p class="muted">Bu aralıkta öneri yok.</p>{% endfor %}
+    </article>
+    <article class="card wide"><h2>Son değerlendirmeler</h2><div style="overflow:auto"><table>
+      <thead><tr><th>Tarih</th><th>Skor</th><th>STT</th><th>Özet</th><th>Sorunlar</th><th>Recording ID</th></tr></thead>
+      <tbody>{% for row in dashboard.evaluations %}
+        <tr><td>{{ row.created_at }}</td><td><strong>{{ row.overall_score }}/100</strong></td><td>{{ row.match_score if row.match_score is not none else '–' }}</td><td>{{ row.summary }}</td><td>{{ row.issues|length }}</td><td><code>{{ row.recording_id }}</code></td></tr>
+      {% else %}<tr><td colspan="6" class="muted">Kayıt bulunamadı.</td></tr>{% endfor %}</tbody>
+    </table></div></article>
+  </section>
+</main>
+<script>
+const series={{ dashboard.series|tojson }}, criteria={{ dashboard.criteria_averages|tojson }}, barge={{ dashboard.barge_in_latencies|tojson }};
+const common={responsive:true,maintainAspectRatio:false,plugins:{legend:{labels:{color:"#cbd5e1"}}},scales:{x:{ticks:{color:"#9aa6bf"},grid:{color:"#26314a"}},y:{ticks:{color:"#9aa6bf"},grid:{color:"#26314a"}}}};
+new Chart(document.getElementById("trend"),{type:"line",data:{labels:series.map(x=>new Date(x.created_at).toLocaleString("tr-TR")),datasets:[{label:"Kalite",data:series.map(x=>x.overall_score),borderColor:"#8b5cf6",tension:.3},{label:"STT eşleşme",data:series.map(x=>x.match_score),borderColor:"#22d3ee",tension:.3}]},options:common});
+new Chart(document.getElementById("criteria"),{type:"bar",data:{labels:Object.keys(criteria),datasets:[{label:"Ortalama /10",data:Object.values(criteria),backgroundColor:"#8b5cf6"}]},options:{...common,indexAxis:"y"}});
+new Chart(document.getElementById("barge"),{type:"bar",data:{labels:barge.map((_,i)=>i+1),datasets:[{label:"Tepki (ms)",data:barge,backgroundColor:"#22d3ee"}]},options:common});
+</script>
+</body>
+</html>
