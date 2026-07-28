@@ -18,15 +18,17 @@ içindeki assertBotAdmin / getBotAdminAccess ve public/js/admin-bot.js.
 """
 
 import os
+import secrets
 from functools import wraps
 
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, jsonify, redirect, request
 
 import database as db
 
 admin_bp = Blueprint("admin_bp", __name__, url_prefix="/api/admin")
 
 ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY", "")
+VOICE_RECORDINGS_API_KEY = os.environ.get("VOICE_RECORDINGS_API_KEY", "")
 
 
 def require_admin_key(view_func):
@@ -43,6 +45,22 @@ def require_admin_key(view_func):
         if provided != ADMIN_API_KEY:
             return jsonify({"status": "error", "message": "Yetkisiz erişim."}), 401
 
+        return view_func(*args, **kwargs)
+    return wrapper
+
+
+def require_voice_recordings_key(view_func):
+    """Koordinatöre yalnızca ses kayıtlarına erişim yetkisi verir."""
+    @wraps(view_func)
+    def wrapper(*args, **kwargs):
+        if not VOICE_RECORDINGS_API_KEY:
+            return jsonify({
+                "status": "error",
+                "message": "VOICE_RECORDINGS_API_KEY tanımlı değil.",
+            }), 503
+        provided = request.headers.get("X-Voice-Recordings-Key", "")
+        if not secrets.compare_digest(provided, VOICE_RECORDINGS_API_KEY):
+            return jsonify({"status": "error", "message": "Yetkisiz erişim."}), 401
         return view_func(*args, **kwargs)
     return wrapper
 
@@ -154,3 +172,57 @@ def performance_metrics():
         "session_id": session_id,
         "pagination": {"limit": limit, "offset": offset, "total": total},
     }), 200
+
+
+@admin_bp.route("/voice-recordings", methods=["GET"])
+@require_voice_recordings_key
+def list_voice_recordings():
+    limit, offset = _pagination_params(default_limit=50, max_limit=200)
+    session_id = request.args.get("session_id") or None
+    recordings = db.list_voice_recordings_api(
+        limit=limit,
+        offset=offset,
+        session_id=session_id,
+    )
+    base_url = request.host_url.rstrip("/")
+    for recording in recordings:
+        recording_id = recording["id"]
+        recording["user_download_url"] = (
+            f"{base_url}/api/admin/voice-recordings/"
+            f"{recording_id}/user"
+        )
+        recording["agent_download_url"] = (
+            f"{base_url}/api/admin/voice-recordings/"
+            f"{recording_id}/agent"
+        )
+
+    total = db.count_voice_recordings_api(session_id=session_id)
+    return jsonify({
+        "status": "success",
+        "data": recordings,
+        "pagination": {
+            "limit": limit,
+            "offset": offset,
+            "total": total,
+        },
+    }), 200
+
+
+@admin_bp.route(
+    "/voice-recordings/<recording_id>/<track>",
+    methods=["GET"],
+)
+@require_voice_recordings_key
+def download_voice_recording(recording_id, track):
+    if track not in {"user", "agent"}:
+        return jsonify({
+            "status": "error",
+            "message": "track yalnızca user veya agent olabilir.",
+        }), 400
+    download_url = db.get_voice_recording_download_url(recording_id, track)
+    if not download_url:
+        return jsonify({
+            "status": "error",
+            "message": "Hazır ses kaydı bulunamadı.",
+        }), 404
+    return redirect(download_url, code=302)

@@ -267,6 +267,87 @@ def get_voice_recordings_admin(session_id):
     return result
 
 
+def list_voice_recordings_api(limit=50, offset=0, session_id=None):
+    """Dış entegrasyon API'si için kayıt metadata listesini döndürür."""
+    collection = _get_db().collection(COL_VOICE_RECORDINGS)
+    if session_id:
+        docs = list(
+            collection
+            .where(filter=FieldFilter("session_id", "==", session_id))
+            .stream()
+        )
+        docs.sort(
+            key=lambda d: (
+                d.to_dict().get("created_at").timestamp()
+                if isinstance(d.to_dict().get("created_at"), datetime)
+                else 0
+            ),
+            reverse=True,
+        )
+    else:
+        docs = list(
+            collection
+            .order_by("created_at", direction=firestore.Query.DESCENDING)
+            .limit(limit + offset)
+            .stream()
+        )
+
+    rows = []
+    for doc in docs[offset:offset + limit]:
+        data = doc.to_dict()
+        rows.append({
+            "id": doc.id,
+            "session_id": data.get("session_id"),
+            "user_id": data.get("user_id"),
+            "username": data.get("username"),
+            "status": data.get("status"),
+            "user_duration_ms": data.get("user_duration_ms"),
+            "agent_duration_ms": data.get("agent_duration_ms"),
+            "created_at": _iso(data.get("created_at")),
+            "uploaded_at": _iso(data.get("uploaded_at")),
+        })
+    return rows
+
+
+def count_voice_recordings_api(session_id=None):
+    collection = _get_db().collection(COL_VOICE_RECORDINGS)
+    query = collection
+    if session_id:
+        query = query.where(
+            filter=FieldFilter("session_id", "==", session_id)
+        )
+    return query.count().get()[0][0].value
+
+
+def get_voice_recording_download_url(recording_id, track):
+    """Private WAV için 5 dakika geçerli indirme bağlantısı üretir."""
+    if track not in {"user", "agent"}:
+        return None
+    snap = (
+        _get_db().collection(COL_VOICE_RECORDINGS)
+        .document(recording_id)
+        .get()
+    )
+    if not snap.exists:
+        return None
+    data = snap.to_dict()
+    if data.get("status") != "ready":
+        return None
+    storage_path = data.get(f"{track}_storage_path")
+    bucket_name = _storage_bucket_name()
+    if not storage_path or not bucket_name:
+        return None
+
+    return storage.bucket(bucket_name).blob(storage_path).generate_signed_url(
+        version="v4",
+        expiration=timedelta(minutes=5),
+        method="GET",
+        response_disposition=(
+            f'attachment; filename="{recording_id}-{track}.wav"'
+        ),
+    )
+
+
 def get_session_transcript(session_id, limit=50):
     db = _get_db()
     query = (
