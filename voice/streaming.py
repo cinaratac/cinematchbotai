@@ -16,7 +16,7 @@ from voice.config import (
     DEEPGRAM_API_KEY,
     VOICE_AGENT_PROMPT,
     VOICE_API_KEY,
-    cors_headers,
+    cors_headers as build_cors_headers,
 )
 from voice.recording import VoiceRecordingSession
 from voice.metrics import build_voice_metric
@@ -95,7 +95,7 @@ def _streaming_agent_settings(app_profile, history, input_sample_rate):
 
 async def voice_stream(request):
     """Tarayıcı ile Deepgram arasında düşük gecikmeli PCM WebSocket köprüsü."""
-    cors_headers = cors_headers(request)
+    cors_headers = build_cors_headers(request)
     if request.headers.get("Origin") and "Access-Control-Allow-Origin" not in cors_headers:
         return web.json_response(
             {"status": "error", "message": "Bu origin için erişim izni yok."},

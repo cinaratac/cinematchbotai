@@ -13,7 +13,7 @@ from voice.config import (
     DEEPGRAM_API_KEY,
     PEER_CONNECTIONS,
     VOICE_AGENT_PROMPT,
-    cors_headers,
+    cors_headers as build_cors_headers,
     request_is_authorized,
     rtc_configuration,
 )
@@ -332,7 +332,7 @@ async def handle_user_speech(track, pc, user_context, output_track):
 
 
 async def offer(request):
-    cors_headers = cors_headers(request)
+    cors_headers = build_cors_headers(request)
     if request.headers.get("Origin") and "Access-Control-Allow-Origin" not in cors_headers:
         return web.json_response(
             {"status": "error", "message": "Bu origin için erişim izni yok."},
@@ -438,7 +438,7 @@ async def offer(request):
     )
 
 async def options_handler(request):
-    headers = cors_headers(request)
+    headers = build_cors_headers(request)
     if request.headers.get("Origin") and "Access-Control-Allow-Origin" not in headers:
         return web.Response(status=403, headers=headers)
     return web.Response(status=204, headers=headers)
