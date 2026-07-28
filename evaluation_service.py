@@ -21,6 +21,7 @@ EVALUATION_MODEL = os.environ.get(
     # QA gibi uzun ve yapılandırılmış çıktı işlerinde kararlı managed model.
     "gemini-2.5-flash",
 )
+EVALUATION_TASKS = set()
 
 CRITERIA = {
     "intent_understanding": "Kullanıcının niyetini doğru anlama",
@@ -123,7 +124,7 @@ def _validate_result(result):
     return result
 
 
-async def _call_deepgram_evaluator(payload):
+async def _call_deepgram_evaluator(payload, provider_type, model):
     if not DEEPGRAM_API_KEY:
         raise RuntimeError("DEEPGRAM_API_KEY tanımlı değil.")
 
@@ -149,8 +150,8 @@ async def _call_deepgram_evaluator(payload):
             },
             "think": {
                 "provider": {
-                    "type": "google",
-                    "model": EVALUATION_MODEL,
+                    "type": provider_type,
+                    "model": model,
                     "temperature": 0.1,
                 },
                 "prompt": EVALUATOR_PROMPT,
@@ -211,12 +212,19 @@ async def _call_deepgram_evaluator(payload):
 
 
 async def evaluate_voice_session(session_id, recording_id):
+    provider_chain = [
+        ("google", EVALUATION_MODEL),
+        # Bu OpenRouter değildir; Deepgram'ın yönettiği standart fallback'tir.
+        ("open_ai", "gpt-4o-mini"),
+    ]
     try:
         await asyncio.to_thread(
             start_voice_ai_evaluation,
             session_id,
             recording_id,
-            EVALUATION_MODEL,
+            " -> ".join(
+                f"{provider}/{model}" for provider, model in provider_chain
+            ),
         )
         transcript = await asyncio.to_thread(
             get_session_transcript, session_id, 100
@@ -252,12 +260,41 @@ async def evaluate_voice_session(session_id, recording_id):
             for key, value in performance.items()
             if not key.startswith("_")
         }
-        raw_result = await _call_deepgram_evaluator({
+        evaluation_payload = {
             "criteria": CRITERIA,
             "transcript": turns,
             "performance_metrics_ms": performance_summary,
-        })
+        }
+        provider_errors = []
+        raw_result = None
+        used_provider = None
+        used_model = None
+        for provider_type, model in provider_chain:
+            try:
+                raw_result = await _call_deepgram_evaluator(
+                    evaluation_payload,
+                    provider_type,
+                    model,
+                )
+                used_provider = provider_type
+                used_model = model
+                break
+            except Exception as provider_error:
+                provider_errors.append(
+                    f"{provider_type}/{model}: {provider_error}"
+                )
+                print(
+                    "Voice QA model denemesi başarısız:",
+                    provider_errors[-1],
+                )
+        if raw_result is None:
+            raise RuntimeError(
+                "Tüm managed QA modelleri başarısız: "
+                + " | ".join(provider_errors)
+            )
         result = _validate_result(raw_result)
+        result["evaluator_provider"] = used_provider
+        result["evaluator_model"] = used_model
         await asyncio.to_thread(
             complete_voice_ai_evaluation, recording_id, result
         )
@@ -270,3 +307,25 @@ async def evaluate_voice_session(session_id, recording_id):
             )
         except Exception as persist_exc:
             print("Değerlendirme hata kaydı yazılamadı:", repr(persist_exc))
+
+
+def schedule_voice_evaluation(session_id, recording_id):
+    """WebSocket requestinden bağımsız bir QA taskı başlatır."""
+    print("Voice AI değerlendirmesi arka plana alındı:", recording_id)
+    task = asyncio.create_task(
+        evaluate_voice_session(session_id, recording_id),
+        name=f"voice-evaluation-{recording_id}",
+    )
+    EVALUATION_TASKS.add(task)
+
+    def evaluation_done(completed_task):
+        EVALUATION_TASKS.discard(completed_task)
+        if completed_task.cancelled():
+            print("Voice AI değerlendirme taskı iptal edildi:", recording_id)
+            return
+        error = completed_task.exception()
+        if error:
+            print("Voice AI background task hatası:", repr(error))
+
+    task.add_done_callback(evaluation_done)
+    return task

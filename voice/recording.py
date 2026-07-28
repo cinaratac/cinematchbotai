@@ -5,7 +5,7 @@ import uuid
 import wave
 
 from database import save_voice_recording
-from evaluation_service import evaluate_voice_session
+from evaluation_service import schedule_voice_evaluation
 
 
 class VoiceRecordingSession:
@@ -106,7 +106,7 @@ class VoiceRecordingSession:
                 ).lower()
                 not in {"0", "false", "no"}
             ):
-                await evaluate_voice_session(
+                schedule_voice_evaluation(
                     self.session_id,
                     self.recording_id,
                 )

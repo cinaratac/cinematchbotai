@@ -349,13 +349,13 @@ def get_voice_recording_download_url(recording_id, track):
     )
 
 
-def start_voice_ai_evaluation(session_id, recording_id, model):
+def start_voice_ai_evaluation(session_id, recording_id, model_chain):
     ref = _get_db().collection(COL_VOICE_AI_EVALUATIONS).document(recording_id)
     ref.set({
         "session_id": session_id,
         "recording_id": recording_id,
         "status": "processing",
-        "model": f"deepgram-managed/google/{model}",
+        "model_chain": model_chain,
         "created_at": _now(),
         "updated_at": _now(),
     })
