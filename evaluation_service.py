@@ -174,7 +174,17 @@ async def _call_deepgram_evaluator(payload, provider_type, model):
         },
     }
 
+    serialized_payload = json.dumps(payload, ensure_ascii=False)
+    print(
+        "Voice QA isteği:",
+        f"provider={provider_type}",
+        f"model={model}",
+        f"system_prompt_chars={len(EVALUATOR_PROMPT)}",
+        f"payload_chars={len(serialized_payload)}",
+    )
+
     timeout = aiohttp.ClientTimeout(total=90)
+    provider_warnings = []
     async with aiohttp.ClientSession(timeout=timeout) as session:
         async with session.ws_connect(
             "wss://agent.deepgram.com/v1/agent/converse",
@@ -191,13 +201,20 @@ async def _call_deepgram_evaluator(payload, provider_type, model):
                 elif event_type == "SettingsApplied":
                     await ws.send_json({
                         "type": "InjectUserMessage",
-                        "content": json.dumps(payload, ensure_ascii=False),
+                        "content": serialized_payload,
                     })
                 elif (
                     event_type == "ConversationText"
                     and event.get("role") == "assistant"
                 ):
                     return _extract_json(event.get("content"))
+                elif event_type == "Warning":
+                    warning = (
+                        f"{event.get('code') or 'WARNING'}: "
+                        f"{event.get('description') or event.get('message') or ''}"
+                    )
+                    provider_warnings.append(warning)
+                    print("Voice QA Deepgram uyarısı:", warning)
                 elif event_type == "Error":
                     detail = (
                         event.get("description")
@@ -205,8 +222,14 @@ async def _call_deepgram_evaluator(payload, provider_type, model):
                         or "Deepgram evaluator hatası."
                     )
                     code = event.get("code")
+                    warning_detail = (
+                        " | warnings=" + " || ".join(provider_warnings)
+                        if provider_warnings
+                        else ""
+                    )
                     raise RuntimeError(
                         f"{detail}{f' (code={code})' if code else ''}"
+                        f"{warning_detail}"
                     )
     raise RuntimeError("Değerlendirme agentından cevap alınamadı.")
 
