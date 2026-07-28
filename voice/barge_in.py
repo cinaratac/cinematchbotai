@@ -71,3 +71,10 @@ class BargeInState:
     def record_agent_done(self):
         if self.phase == BargeInPhase.SPEAKING:
             self.phase = BargeInPhase.IDLE
+
+    def record_suppressed_response(self):
+        """Tamamlanmamış kullanıcı turuna üretilen sesi sessizce bırak."""
+        self.client_interrupt_started = None
+        self.drop_interrupted_audio = False
+        self.interrupted_user_committed = False
+        self.phase = BargeInPhase.IDLE

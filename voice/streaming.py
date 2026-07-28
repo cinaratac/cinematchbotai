@@ -1,5 +1,6 @@
 import asyncio
 import json
+import re
 import time
 
 import aiohttp
@@ -27,6 +28,36 @@ from voice.activity import (
 )
 
 
+_HESITATION_ENDINGS = {
+    "hmm", "hımm", "ııı", "eee", "şey", "sanırım", "düşünüyorum",
+    "bekle", "dur", "ve", "ama", "çünkü", "yani", "bir", "bu", "şu",
+    "ile", "için", "gibi", "olarak",
+}
+_HESITATION_PHRASES = {
+    "bir saniye", "bir dakika", "nasıl desem", "şöyle düşünüyorum",
+    "düşünüyorum şu an", "dur düşüneyim",
+}
+
+
+def _looks_like_incomplete_thought(text):
+    """Kısa düşünme dolgularını tamamlanmış kullanıcı isteği sayma."""
+    normalized = re.sub(
+        r"[^a-zçğıöşü0-9 ]+", " ", str(text or "").casefold()
+    )
+    normalized = " ".join(normalized.split())
+    if not normalized:
+        return False
+    words = normalized.split()
+    return (
+        normalized in _HESITATION_PHRASES
+        or words[-1] in _HESITATION_ENDINGS
+        or (
+            len(words) <= 4
+            and any(token in _HESITATION_ENDINGS for token in words)
+        )
+    )
+
+
 def _streaming_agent_settings(app_profile, history, input_sample_rate):
     history_messages = []
     for row in history:
@@ -47,7 +78,10 @@ def _streaming_agent_settings(app_profile, history, input_sample_rate):
     prompt = (
         f"{VOICE_AGENT_PROMPT}\n\n"
         f"KULLANICI ZEVK PROFİLİ: {profile_text}\n"
-        "Bu tercihleri film önerilerinde doğal biçimde dikkate al."
+        "Bu tercihleri film önerilerinde doğal biçimde dikkate al.\n"
+        "Kullanıcı yalnızca 'hmm', 'şey', 'sanırım', 'düşünüyorum', "
+        "'bir saniye' gibi düşünme/duraksama ifadesi söylediyse bunu "
+        "tamamlanmış bir istek sayma ve yeni bir konuya cevap verme."
     )
     return {
         "type": "Settings",
@@ -185,6 +219,7 @@ async def voice_stream(request):
                 audio_done_at = None
                 user_transcript_ready_at = None
                 assistant_text_ready_at = None
+                suppress_current_assistant = False
 
                 def track_persistence_task(task):
                     persistence_tasks.discard(task)
@@ -321,9 +356,13 @@ async def voice_stream(request):
                     nonlocal audio_done_at
                     nonlocal user_transcript_ready_at
                     nonlocal assistant_text_ready_at
+                    nonlocal suppress_current_assistant
                     async for message in agent_ws:
                         if message.type == aiohttp.WSMsgType.BINARY:
-                            if not barge_in.drop_interrupted_audio:
+                            if (
+                                not barge_in.drop_interrupted_audio
+                                and not suppress_current_assistant
+                            ):
                                 if first_audio_at is None:
                                     first_audio_at = time.perf_counter()
                                 if recording:
@@ -350,6 +389,15 @@ async def voice_stream(request):
                             role = event.get("role")
                             content = str(event.get("content") or "").strip()
                             if not content:
+                                continue
+                            if (
+                                role == "assistant"
+                                and suppress_current_assistant
+                            ):
+                                # Deepgram turu erken bitirmiş olsa bile
+                                # düşünme dolgusuna üretilen cevabı gösterme,
+                                # kaydetme veya QA verisine dahil etme.
+                                pending_user_text = None
                                 continue
                             if (
                                 role == "assistant"
@@ -382,6 +430,15 @@ async def voice_stream(request):
                             })
                             if role == "user":
                                 pending_user_text = content
+                                suppress_current_assistant = (
+                                    _looks_like_incomplete_thought(content)
+                                )
+                                if suppress_current_assistant:
+                                    barge_in.drop_interrupted_audio = True
+                                    await ws.send_json({
+                                        "type": "listening_wait",
+                                        "reason": "incomplete_thought",
+                                    })
                                 user_transcript_ready_at = time.perf_counter()
                                 assistant_text_ready_at = None
                                 turn_metric_logged = False
@@ -426,6 +483,8 @@ async def voice_stream(request):
                             ):
                                 if isinstance(event.get(field), (int, float)):
                                     latency_event[field] = event[field]
+                            if suppress_current_assistant:
+                                continue
                             if (
                                 barge_in.drop_interrupted_audio
                                 and not barge_in.interrupted_user_committed
@@ -446,6 +505,12 @@ async def voice_stream(request):
                             )
                             await ws.send_json({"type": "speaking"})
                         elif event_type == "AgentAudioDone":
+                            if suppress_current_assistant:
+                                suppress_current_assistant = False
+                                pending_user_text = None
+                                barge_in.record_suppressed_response()
+                                await ws.send_json({"type": "listening"})
+                                continue
                             barge_in.record_agent_done()
                             await ws.send_json({"type": "audio_done"})
                         elif event_type == "LatencyReport":

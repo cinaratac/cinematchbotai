@@ -1,7 +1,9 @@
 import asyncio
+from difflib import SequenceMatcher
 import json
 import os
 import re
+import unicodedata
 
 import aiohttp
 
@@ -65,6 +67,26 @@ taşıyan eş anlamlı ifade farklarını speech_recognition_error sayma. Örne�
 Hata ancak kullanıcının niyeti, varlık adı, sayı, olumsuzluk, tercih veya
 cevabın yönü değişiyorsa raporlanmalıdır. Kanıt alanında iki taraftaki gerçek
 ifadeyi aynen göster; transkriptte bulunmayan örnek uydurma.
+logged_transcript içindeki "user" alanı canlı STT'nin kullanıcıdan anladığı
+metindir; "assistant" alanı agent cevabıdır. speech_recognition_error için
+assistant cevabını, agentın duyduğu kullanıcı metni gibi kullanma. Bu kriterde
+yalnızca audio_utterances ile "user" alanlarını karşılaştır.
+deterministic_match_score kodla hesaplanmıştır; match_score alanına bu değeri
+aynen yaz ve kendi tahmininle değiştirme.
+
+PUAN KALİBRASYONU:
+- 9-10: Tam veya tama yakın başarı.
+- 7-8: Genel olarak başarılı, sınırlı ve düşük etkili sorunlar var.
+- 5-6: Birden fazla belirgin sorun var ama görüşme kısmen işe yarıyor.
+- 0-4: Ciddi/tekrarlayan başarısızlık veya hedefin gerçekleştirilememesi.
+Tek bir hatayı ilgililik, niyet, doğruluk, bağlam ve görev tamamlama altında
+kanıtsız biçimde beş kez cezalandırma. Her observed=true kriterinin reason
+alanında ilgili turn_index ve somut ifade bulunmalıdır; somut kanıt yoksa
+observed=false kullan. "accuracy" yalnızca yanlış olgusal iddia veya
+halüsinasyon içindir; STT/niyet hatasını accuracy kriterine tekrar yazma.
+Doğal ve akıcı gerçek assistant metni varsa naturalness puanını genel bir
+"doğal değildi" cümlesiyle düşürme. overall_score gözlenen kriterlerle ve
+sorunların gerçek kullanıcı etkisiyle tutarlı olmalıdır.
 
 Sonucu serbest metin olarak yazma. Daima submit_evaluation fonksiyonunu çağır.
 Fonksiyon argümanlarını aşağıdaki şemaya göre doldur:
@@ -277,6 +299,25 @@ def _extract_json(text):
     return json.loads(clean[start:end + 1])
 
 
+def _normalize_transcript(text):
+    normalized = unicodedata.normalize("NFKC", str(text or "").casefold())
+    normalized = re.sub(r"[^a-zçğıöşü0-9 ]+", " ", normalized)
+    return " ".join(normalized.split())
+
+
+def _transcript_match_score(audio_text, logged_user_texts):
+    """İki STT çıktısının deterministik kelime dizisi benzerliği."""
+    audio_words = _normalize_transcript(audio_text).split()
+    logged_words = _normalize_transcript(
+        " ".join(str(text or "") for text in logged_user_texts)
+    ).split()
+    if not audio_words or not logged_words:
+        return 0
+    return round(
+        SequenceMatcher(None, audio_words, logged_words).ratio() * 100
+    )
+
+
 def _validate_result(result):
     if not isinstance(result, dict):
         raise ValueError("Değerlendirme sonucu nesne değil.")
@@ -386,7 +427,15 @@ async def _transcribe_recording(recording_id):
         recording_id,
         f"chars={len(transcript)}",
     )
-    return transcript
+    utterances = [
+        str(item.get("transcript") or "").strip()
+        for item in body.get("results", {}).get("utterances", [])
+        if str(item.get("transcript") or "").strip()
+    ]
+    return {
+        "transcript": transcript,
+        "utterances": utterances or [transcript],
+    }
 
 
 async def _call_deepgram_evaluator_once(payload, provider_type, model):
@@ -598,7 +647,8 @@ async def evaluate_voice_session(session_id, recording_id):
                 recording_id,
             )
             return
-        audio_transcript = await _transcribe_recording(recording_id)
+        audio_result = await _transcribe_recording(recording_id)
+        audio_transcript = audio_result["transcript"]
         performance = await asyncio.to_thread(
             get_performance_metrics_averages,
             200,
@@ -621,10 +671,19 @@ async def evaluate_voice_session(session_id, recording_id):
             for key, value in performance.items()
             if not key.startswith("_")
         }
+        logged_user_texts = [
+            turn["user"] for turn in turns if turn.get("user")
+        ]
+        deterministic_match_score = _transcript_match_score(
+            audio_transcript,
+            logged_user_texts,
+        )
         evaluation_payload = {
             "criteria": CRITERIA,
             "audio_transcript": audio_transcript,
+            "audio_utterances": audio_result["utterances"],
             "logged_transcript": turns,
+            "deterministic_match_score": deterministic_match_score,
             "performance_metrics_ms": performance_summary,
             "barge_in_metrics": {
                 "average_latency_ms": performance_summary.get(
@@ -662,13 +721,22 @@ async def evaluate_voice_session(session_id, recording_id):
                 "Tüm managed QA modelleri başarısız: "
                 + " | ".join(provider_errors)
             )
+        comparison = raw_result.setdefault("transcript_comparison", {})
+        comparison["match_score"] = deterministic_match_score
+        if deterministic_match_score >= 92:
+            raw_result["issues"] = [
+                issue
+                for issue in raw_result.get("issues") or []
+                if (
+                    not isinstance(issue, dict)
+                    or issue.get("type") != "speech_recognition_error"
+                )
+            ]
         result = _validate_result(raw_result)
         result["evaluator_provider"] = used_provider
         result["evaluator_model"] = used_model
         result["audio_transcript"] = audio_transcript
-        result["logged_user_transcript"] = [
-            turn["user"] for turn in turns if turn.get("user")
-        ]
+        result["logged_user_transcript"] = logged_user_texts
         await asyncio.to_thread(
             complete_voice_ai_evaluation, recording_id, result
         )
