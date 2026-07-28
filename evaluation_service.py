@@ -15,6 +15,7 @@ from database import (
 )
 
 
+
 DEEPGRAM_API_KEY = os.environ.get("DEEPGRAM_API_KEY", "")
 EVALUATION_MODEL = os.environ.get(
     "VOICE_EVALUATION_MODEL",
@@ -42,7 +43,8 @@ Sana verilen transkripti ve performans özetini yalnızca kanıta dayanarak
 değerlendir. Her kriteri 0-10 arasında puanla. Transkriptte gözlenemeyen bir
 kriter için score=null ve observed=false kullan; veri uydurma.
 
-Yalnızca geçerli JSON döndür. Markdown veya açıklama ekleme. Şema:
+Sonucu serbest metin olarak yazma. Daima submit_evaluation fonksiyonunu çağır.
+Fonksiyon argümanlarını aşağıdaki şemaya göre doldur:
 {
   "overall_score": 0-100,
   "summary": "kısa yönetici özeti",
@@ -77,6 +79,97 @@ Prompt önerisi yalnızca transkriptte gerçek bir problem varsa üret. Sistem
 promptunu otomatik değiştirme. Barge-in ve tool kullanımı transkriptten
 gözlenemiyorsa bunları puanlama.
 """.strip()
+
+
+def _criterion_function_schema():
+    return {
+        "type": "object",
+        "properties": {
+            "score": {
+                "type": "number",
+                "description": "Gözlenebiliyorsa 0-10 puan.",
+            },
+            "observed": {"type": "boolean"},
+            "reason": {"type": "string"},
+        },
+        "required": ["observed", "reason"],
+    }
+
+
+EVALUATION_FUNCTION = {
+    "name": "submit_evaluation",
+    "description": (
+        "CineMatch görüşmesinin yapılandırılmış kalite raporunu teslim eder. "
+        "Her değerlendirmede bu fonksiyon tam bir kez çağrılmalıdır."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "overall_score": {"type": "number"},
+            "summary": {"type": "string"},
+            "criteria": {
+                "type": "object",
+                "properties": {
+                    key: _criterion_function_schema() for key in CRITERIA
+                },
+                "required": list(CRITERIA),
+            },
+            "issues": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "type": {"type": "string"},
+                        "severity": {
+                            "type": "string",
+                            "enum": ["low", "medium", "high", "critical"],
+                        },
+                        "evidence": {"type": "string"},
+                        "recommendation": {"type": "string"},
+                    },
+                    "required": [
+                        "type", "severity", "evidence", "recommendation"
+                    ],
+                },
+            },
+            "strengths": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+            "prompt_recommendations": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "priority": {
+                            "type": "string",
+                            "enum": ["low", "medium", "high"],
+                        },
+                        "problem": {"type": "string"},
+                        "suggested_instruction": {"type": "string"},
+                        "expected_effect": {"type": "string"},
+                        "evidence": {"type": "string"},
+                    },
+                    "required": [
+                        "priority",
+                        "problem",
+                        "suggested_instruction",
+                        "expected_effect",
+                        "evidence",
+                    ],
+                },
+            },
+        },
+        "required": [
+            "overall_score",
+            "summary",
+            "criteria",
+            "issues",
+            "strengths",
+            "prompt_recommendations",
+        ],
+    },
+}
 
 
 def _extract_json(text):
@@ -155,6 +248,7 @@ async def _call_deepgram_evaluator(payload, provider_type, model):
                     "temperature": 0.1,
                 },
                 "prompt": EVALUATOR_PROMPT,
+                "functions": [EVALUATION_FUNCTION],
             },
             "speak": {
                 "provider": {
@@ -203,6 +297,20 @@ async def _call_deepgram_evaluator(payload, provider_type, model):
                         "type": "InjectUserMessage",
                         "content": serialized_payload,
                     })
+                elif (
+                    event_type == "FunctionCallRequest"
+                ):
+                    for function_call in event.get("functions") or []:
+                        if function_call.get("name") != "submit_evaluation":
+                            continue
+                        arguments = function_call.get("arguments")
+                        if isinstance(arguments, dict):
+                            return arguments
+                        if isinstance(arguments, str):
+                            return json.loads(arguments)
+                    raise RuntimeError(
+                        "QA agentı beklenmeyen bir function çağırdı."
+                    )
                 elif (
                     event_type == "ConversationText"
                     and event.get("role") == "assistant"
