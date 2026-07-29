@@ -376,7 +376,9 @@ def _transcript_match_score(audio_text, logged_user_texts):
 def _contains_quoted_evidence(source_text, claimed_text):
     source = _normalize_transcript(source_text)
     claimed = _normalize_transcript(claimed_text)
-    return bool(claimed and len(claimed.split()) >= 2 and claimed in source)
+    # Tek kelimelik gerçek yanıtlar (ör. “Merhaba”, film adı veya özel ad)
+    # de geçerli kanıt olabilir. Kaynakta birebir bulunma şartı korunur.
+    return bool(claimed and claimed in source)
 
 
 def _has_evidence_overlap(source_text, evidence):
@@ -399,10 +401,15 @@ def _has_evidence_overlap(source_text, evidence):
 
 def _reason_has_source_quote(source_text, reason):
     quotes = re.findall(r'["“]([^"”]+)["”]', str(reason or ""))
-    return any(
+    if any(
         _contains_quoted_evidence(source_text, quote)
         for quote in quotes
-    )
+    ):
+        return True
+    # Model bazen gerçek alıntıyı tırnaksız, "Turn 1: ..." biçiminde
+    # gönderiyor. En az iki ardışık kaynak kelimesi gerçekten geçiyorsa bunu
+    # kanıt kabul et; kaynak dışı genel gerekçeler yine elenir.
+    return _has_evidence_overlap(source_text, reason)
 
 
 def _validate_qa_evidence(result, audio_text, turns, agent_audio_text=""):
@@ -455,8 +462,18 @@ def _validate_qa_evidence(result, audio_text, turns, agent_audio_text=""):
     # sahte bir alıntı taşıyabilir. Böyle bir kriter gözlenmiş sayılamaz;
     # diğer kriterleri ve transcript karşılaştırmasını değiştirmiyoruz.
     criteria = result.get("criteria") or {}
-    for item in criteria.values():
+    for criterion_key, item in criteria.items():
         if not isinstance(item, dict) or item.get("observed") is not True:
+            continue
+        if criterion_key == "speech_recognition_accuracy":
+            # Bu kriterin puanı kod tarafından bağımsız STT eşleşmesinden
+            # üretildiği için model gerekçesinde alıntı bulunmasa da ölçüm
+            # geçerlidir. Puanı _validate_result deterministik olarak yazar.
+            item["reason"] = (
+                "Bağımsız kullanıcı ses transkripti ile canlı kullanıcı "
+                "STT eşleşmesi: "
+                f"{(comparison.get('match_score') or 0):g}/100."
+            )
             continue
         if _reason_has_source_quote(all_transcript, item.get("reason")):
             continue
