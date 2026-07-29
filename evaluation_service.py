@@ -1,9 +1,11 @@
 import asyncio
 from difflib import SequenceMatcher
+import io
 import json
 import os
 import re
 import unicodedata
+import wave
 
 import aiohttp
 
@@ -500,18 +502,45 @@ async def _transcribe_recording(recording_id):
     return {
         "transcript": transcript,
         "utterances": utterances or [transcript],
+        # Agent WebSocket API'si yalnızca InjectUserMessage ile çalışmaz;
+        # SettingsApplied sonrası en az bir binary PCM akışı bekler. Aynı
+        # kayıt zaten yukarıda STT için indirildiği için tekrar Storage
+        # indirmeden evaluator'a aktarılır.
+        "wav_bytes": audio_bytes,
     }
 
 
-async def _call_deepgram_evaluator_once(payload, provider_type, model):
+def _recording_wav_to_pcm(wav_bytes):
+    """Kayıt WAV'ini Agent API'nin beklediği ham linear16 PCM'e çevirir."""
+    try:
+        with wave.open(io.BytesIO(wav_bytes), "rb") as recording:
+            channels = recording.getnchannels()
+            sample_width = recording.getsampwidth()
+            sample_rate = recording.getframerate()
+            compression = recording.getcomptype()
+            pcm_bytes = recording.readframes(recording.getnframes())
+    except (EOFError, wave.Error) as exc:
+        raise RuntimeError(f"QA ses kaydı geçerli WAV değil: {exc}") from exc
+    if channels != 1 or sample_width != 2 or compression != "NONE":
+        raise RuntimeError(
+            "QA ses kaydı desteklenmeyen PCM formatında "
+            f"(channels={channels}, sample_width={sample_width}, compression={compression})."
+        )
+    if not pcm_bytes or sample_rate < 8000 or sample_rate > 48000:
+        raise RuntimeError("QA ses kaydı boş veya geçersiz örnekleme hızında.")
+    return pcm_bytes, sample_rate
+
+
+async def _call_deepgram_evaluator_once(payload, provider_type, model, wav_bytes):
     if not DEEPGRAM_API_KEY:
         raise RuntimeError("DEEPGRAM_API_KEY tanımlı değil.")
     serialized_payload = json.dumps(payload, ensure_ascii=False)
+    pcm_bytes, input_sample_rate = _recording_wav_to_pcm(wav_bytes)
     settings = {
         "type": "Settings",
         "tags": ["cinematch", "qa-evaluator"],
         "audio": {
-            "input": {"encoding": "linear16", "sample_rate": 16000},
+            "input": {"encoding": "linear16", "sample_rate": input_sample_rate},
             "output": {"encoding": "linear16", "sample_rate": 24000, "container": "none"},
         },
         "agent": {
@@ -551,6 +580,13 @@ async def _call_deepgram_evaluator_once(payload, provider_type, model):
                 if event_type == "Welcome":
                     await ws.send_json(settings)
                 elif event_type == "SettingsApplied":
+                    # Deepgram Agent API ses-temelli bir WebSocket'tir. Bu
+                    # binary akış olmadan InjectUserMessage tek başına timeout
+                    # olur. Kayıt, gerçek QA verisi olan payload'dan bağımsız
+                    # olarak yalnızca Agent oturumunu doğru başlatır.
+                    chunk_size = input_sample_rate * 2 // 4
+                    for offset in range(0, len(pcm_bytes), chunk_size):
+                        await ws.send_bytes(pcm_bytes[offset:offset + chunk_size])
                     await ws.send_json({"type": "InjectUserMessage", "content": serialized_payload})
                 elif event_type == "FunctionCallRequest":
                     for function_call in event.get("functions") or []:
@@ -570,12 +606,14 @@ async def _call_deepgram_evaluator_once(payload, provider_type, model):
     raise RuntimeError("Değerlendirme agentından cevap alınamadı.")
 
 
-async def _call_deepgram_evaluator(payload, provider_type, model, attempts=3):
+async def _call_deepgram_evaluator(payload, provider_type, model, wav_bytes, attempts=3):
     """Geçici WS/provider hatalarında üstel geri çekilmeli yeniden deneme."""
     errors = []
     for attempt in range(1, attempts + 1):
         try:
-            return await _call_deepgram_evaluator_once(payload, provider_type, model)
+            return await _call_deepgram_evaluator_once(
+                payload, provider_type, model, wav_bytes
+            )
         except (aiohttp.ClientError, asyncio.TimeoutError, RuntimeError) as exc:
             errors.append(str(exc))
             detail = str(exc).lower()
@@ -713,7 +751,10 @@ async def evaluate_voice_session(
         for provider_type, model in provider_chain:
             try:
                 candidate_result = await _call_deepgram_evaluator(
-                    evaluation_payload, provider_type, model
+                    evaluation_payload,
+                    provider_type,
+                    model,
+                    audio_result["wav_bytes"],
                 )
                 _validate_qa_evidence(
                     candidate_result,
