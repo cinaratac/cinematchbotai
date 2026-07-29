@@ -35,6 +35,12 @@ VOICE_RECORDINGS_API_KEY = os.environ.get("VOICE_RECORDINGS_API_KEY", "")
 def require_admin_key(view_func):
     @wraps(view_func)
     def wrapper(*args, **kwargs):
+        # Tarayıcı, X-Admin-Key taşıyan cross-origin POST isteklerinden önce
+        # anahtarsız OPTIONS preflight gönderir. Bu istek yetki vermez; CORS
+        # katmanının gerekli Access-Control-* başlıkları ekleyebilmesi için
+        # başarıyla dönmesi gerekir.
+        if request.method == "OPTIONS":
+            return "", 204
         if not ADMIN_API_KEY:
             return jsonify({
                 "status": "error",
@@ -250,7 +256,7 @@ def download_voice_recording(recording_id, track):
 
 @admin_bp.route(
     "/voice-recordings/<recording_id>/qa/re-evaluate",
-    methods=["POST"],
+    methods=["POST", "OPTIONS"],
 )
 @require_admin_key
 def re_evaluate_voice_recording(recording_id):
@@ -279,7 +285,9 @@ def re_evaluate_voice_recording(recording_id):
             "message": "Bu kayıt için zaten çalışan bir değerlendirme var.",
         }), 409
 
-    model_chain = f"openai/{EVALUATION_MODEL} -> openai/gpt-4o"
+    model_chain = (
+        f"openrouter/{EVALUATION_MODEL} -> openrouter/openai/gpt-4o-mini"
+    )
     db.queue_voice_ai_evaluation(
         recording["session_id"], recording_id, model_chain
     )

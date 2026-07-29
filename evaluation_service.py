@@ -23,20 +23,19 @@ from voice.activity import wait_for_voice_idle
 
 
 DEEPGRAM_API_KEY = os.environ.get("DEEPGRAM_API_KEY", "")
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 EVALUATION_MODEL = os.environ.get(
-    "VOICE_EVALUATION_MODEL", "gpt-4o-mini"
+    # Ana agentın kullandığı, Structured Outputs destekli OpenRouter modeli.
+    "VOICE_EVALUATION_MODEL", "google/gemma-4-26b-a4b-it"
 )
-if not EVALUATION_MODEL.startswith("gpt-"):
-    print(
-        "VOICE_EVALUATION_MODEL open_ai sağlayıcısıyla uyumsuz; "
-        "gpt-4o-mini kullanılacak:",
-        EVALUATION_MODEL,
-    )
-    EVALUATION_MODEL = "gpt-4o-mini"
+# Eski Deepgram ayarlarında model adı `gpt-4o-mini` olarak tutuluyordu.
+# OpenRouter model kimliğinde sağlayıcı öneki gerekir; geriye dönük uyumluluk
+# için eski OpenAI model adlarını otomatik dönüştürüyoruz.
+if "/" not in EVALUATION_MODEL:
+    EVALUATION_MODEL = f"openai/{EVALUATION_MODEL}"
 EVALUATION_TASKS = set()
 VOICE_EVALUATION_LOOP = None
-QA_EVALUATOR_VERSION = "openai-responses-json-schema-v1"
+QA_EVALUATOR_VERSION = "openrouter-chat-json-schema-v1"
 STT_REFERENCE_VERSION = "deepgram-nova-3-tr"
 TRANSCRIPT_METRIC_VERSION = "wer-token-v1"
 
@@ -586,42 +585,41 @@ async def _transcribe_recording(recording_id):
     }
 
 
-def _response_output_json(response):
-    """Responses API'nin çıktı bloklarından Structured Output JSON'unu al."""
-    if response.get("status") != "completed":
-        detail = response.get("error") or response.get("incomplete_details")
-        raise RuntimeError(f"OpenAI QA isteği tamamlanmadı: {detail}")
-    for output in response.get("output") or []:
-        for content in output.get("content") or []:
-            if content.get("type") == "refusal":
-                raise RuntimeError(
-                    f"OpenAI QA isteği reddedildi: {content.get('refusal')}"
-                )
-            if content.get("type") == "output_text":
-                return json.loads(content.get("text") or "")
-    raise RuntimeError("OpenAI QA isteği Structured Output döndürmedi.")
+def _openrouter_output_json(response):
+    """OpenRouter Chat Completions Structured Output JSON'unu al."""
+    choices = response.get("choices") or []
+    message = choices[0].get("message") if choices else None
+    content = message.get("content") if isinstance(message, dict) else None
+    if not isinstance(content, str) or not content.strip():
+        raise RuntimeError("OpenRouter QA isteği Structured Output döndürmedi.")
+    return json.loads(content)
 
 
-async def _call_openai_evaluator_once(payload, model):
-    if not OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY tanımlı değil.")
+async def _call_openrouter_evaluator_once(payload, model):
+    if not OPENROUTER_API_KEY:
+        raise RuntimeError("OPENROUTER_API_KEY tanımlı değil.")
     serialized_payload = json.dumps(payload, ensure_ascii=False)
     request_body = {
         "model": model,
-        "instructions": EVALUATOR_PROMPT,
-        "input": serialized_payload,
+        "messages": [
+            {"role": "system", "content": EVALUATOR_PROMPT},
+            {"role": "user", "content": serialized_payload},
+        ],
         "temperature": 0.1,
-        "text": {
-            "format": {
-                "type": "json_schema",
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
                 "name": "voice_qa_evaluation",
                 "strict": True,
                 "schema": EVALUATION_JSON_SCHEMA,
             },
         },
+        # Schema desteği olmayan bir sağlayıcıya sessizce düşmek yerine hata
+        # verip fallback modele geçeriz.
+        "provider": {"require_parameters": True},
     }
     print(
-        "Voice QA OpenAI isteği:",
+        "Voice QA OpenRouter isteği:",
         f"model={model}",
         f"prompt_version={QA_PROMPT_VERSION}",
         f"payload_chars={len(serialized_payload)}",
@@ -629,9 +627,9 @@ async def _call_openai_evaluator_once(payload, model):
     timeout = aiohttp.ClientTimeout(total=90)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         async with session.post(
-            "https://api.openai.com/v1/responses",
+            "https://openrouter.ai/api/v1/chat/completions",
             headers={
-                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
                 "Content-Type": "application/json",
             },
             json=request_body,
@@ -639,17 +637,17 @@ async def _call_openai_evaluator_once(payload, model):
             body = await response.json(content_type=None)
             if response.status >= 400:
                 raise RuntimeError(
-                    f"OpenAI QA hatası ({response.status}): {body}"
+                    f"OpenRouter QA hatası ({response.status}): {body}"
                 )
-    return _response_output_json(body)
+    return _openrouter_output_json(body)
 
 
-async def _call_openai_evaluator(payload, model, attempts=3):
+async def _call_openrouter_evaluator(payload, model, attempts=3):
     """Geçici REST/provider hatalarında üstel geri çekilmeli yeniden deneme."""
     errors = []
     for attempt in range(1, attempts + 1):
         try:
-            return await _call_openai_evaluator_once(payload, model)
+            return await _call_openrouter_evaluator_once(payload, model)
         except (aiohttp.ClientError, asyncio.TimeoutError, RuntimeError) as exc:
             errors.append(str(exc))
             detail = str(exc).lower()
@@ -685,7 +683,10 @@ async def _call_openai_evaluator(payload, model, attempts=3):
 
 
 async def evaluate_voice_session(session_id, recording_id):
-    model_chain = list(dict.fromkeys([EVALUATION_MODEL, "gpt-4o"]))
+    model_chain = list(dict.fromkeys([
+        EVALUATION_MODEL,
+        "openai/gpt-4o-mini",
+    ]))
     try:
         print(
             "Voice AI değerlendirmesi canlı görüşmelerin bitmesini bekliyor:",
@@ -696,7 +697,7 @@ async def evaluate_voice_session(session_id, recording_id):
             start_voice_ai_evaluation,
             session_id,
             recording_id,
-            " -> ".join(f"openai/{model}" for model in model_chain),
+            " -> ".join(f"openrouter/{model}" for model in model_chain),
         )
         transcript = await asyncio.to_thread(
             get_recording_transcript, recording_id, 100
@@ -773,7 +774,7 @@ async def evaluate_voice_session(session_id, recording_id):
         used_model = None
         for model in model_chain:
             try:
-                candidate_result = await _call_openai_evaluator(
+                candidate_result = await _call_openrouter_evaluator(
                     evaluation_payload, model
                 )
                 _validate_qa_evidence(
@@ -782,12 +783,12 @@ async def evaluate_voice_session(session_id, recording_id):
                     turns,
                 )
                 raw_result = candidate_result
-                used_provider = "openai"
+                used_provider = "openrouter"
                 used_model = model
                 break
             except Exception as provider_error:
                 provider_errors.append(
-                    f"openai/{model}: {provider_error}"
+                    f"openrouter/{model}: {provider_error}"
                 )
                 print(
                     "Voice QA model denemesi başarısız:",
@@ -795,7 +796,7 @@ async def evaluate_voice_session(session_id, recording_id):
                 )
         if raw_result is None:
             raise RuntimeError(
-                "Tüm OpenAI QA modelleri başarısız: "
+                "Tüm OpenRouter QA modelleri başarısız: "
                 + " | ".join(provider_errors)
             )
         comparison = raw_result.setdefault("transcript_comparison", {})
