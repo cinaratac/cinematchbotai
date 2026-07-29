@@ -209,7 +209,7 @@ async def voice_stream(request):
             ) as agent_ws:
                 pending_user_text = None
                 turn_user_text = None
-                assistant_text_chunks = []
+                pending_assistant_chunks = []
                 settings_applied = asyncio.Event()
                 persistence_tasks = set()
                 barge_in = BargeInState()
@@ -242,6 +242,27 @@ async def voice_stream(request):
                         recording.recording_id if recording else None,
                     )
                     await asyncio.to_thread(touch_session, session_id)
+
+                def flush_pending_assistant_turn():
+                    """Birikmiş asistan cevabı parçalarını tek bir tur olarak
+                    kaydet. Normalde AgentAudioDone'da çağrılır; yeni bir
+                    kullanıcı turu, önceki turun AgentAudioDone'ı hiç
+                    gelmeden başlarsa (ör. beklenmedik olay sırası) güvenlik
+                    ağı olarak da kullanılır."""
+                    nonlocal turn_user_text, pending_assistant_chunks
+                    if turn_user_text and pending_assistant_chunks:
+                        full_assistant_text = " ".join(
+                            chunk for chunk in pending_assistant_chunks if chunk
+                        )
+                        persistence_task = asyncio.create_task(
+                            persist_turn(turn_user_text, full_assistant_text)
+                        )
+                        persistence_tasks.add(persistence_task)
+                        persistence_task.add_done_callback(
+                            track_persistence_task
+                        )
+                    turn_user_text = None
+                    pending_assistant_chunks = []
 
                 async def persist_latency(
                     measured_first_audio_at,
@@ -352,7 +373,7 @@ async def voice_stream(request):
                 async def agent_to_browser():
                     nonlocal pending_user_text
                     nonlocal turn_user_text
-                    nonlocal assistant_text_chunks
+                    nonlocal pending_assistant_chunks
                     nonlocal deepgram_request_id
                     nonlocal latency_event
                     nonlocal turn_metric_logged
@@ -433,6 +454,7 @@ async def voice_stream(request):
                                 "content": content,
                             })
                             if role == "user":
+                                flush_pending_assistant_turn()
                                 pending_user_text = content
                                 suppress_current_assistant = (
                                     _looks_like_incomplete_thought(content)
@@ -453,24 +475,17 @@ async def voice_stream(request):
                             elif role == "assistant" and (
                                 pending_user_text or turn_user_text
                             ):
+                                # Deepgram bir cevabı tek ConversationText yerine
+                                # birden fazla parça (ör. cümle cümle) halinde
+                                # gönderebiliyor. Turun kullanıcı metnini ilk
+                                # parçada sabitleyip tüm parçaları biriktiriyoruz;
+                                # asıl kayıt AgentAudioDone'da, tam metinle yapılır.
                                 if turn_user_text is None:
                                     turn_user_text = pending_user_text
-                                    pending_user_text = None
-                                    assistant_text_chunks = []
+                                pending_user_text = None
                                 if assistant_text_ready_at is None:
                                     assistant_text_ready_at = time.perf_counter()
-                                # Deepgram tek bir agent yanıtını birden çok
-                                # ConversationText olayıyla akıtabilir. İlk
-                                # parçayı kalıcılaştırıp kalanını kaybetmemek
-                                # için tur tamamlanana (AgentAudioDone) kadar
-                                # biriktiriyoruz.
-                                accumulated = " ".join(assistant_text_chunks)
-                                if accumulated and content.startswith(accumulated):
-                                    # Bazı sağlayıcı sürümleri önceki metni de
-                                    # içeren kümülatif güncelleme gönderebilir.
-                                    assistant_text_chunks = [content]
-                                elif not accumulated.endswith(content):
-                                    assistant_text_chunks.append(content)
+                                pending_assistant_chunks.append(content)
                         elif event_type == "UserStartedSpeaking":
                             accepted = barge_in.record_interrupt(
                                 "deepgram_vad"
@@ -485,11 +500,6 @@ async def voice_stream(request):
                             user_transcript_ready_at = None
                             assistant_text_ready_at = None
                             barge_in.interrupted_user_committed = bool(pending_user_text)
-                            # Yeni kullanıcı konuşması, bitmemiş agent yanıtını
-                            # kesmiştir; oynatılmayan bu yanıt QA dökümüne de
-                            # yazılmamalıdır.
-                            turn_user_text = None
-                            assistant_text_chunks = []
                             await ws.send_json({"type": "interrupt"})
                         elif event_type == "AgentThinking":
                             await ws.send_json({"type": "processing"})
@@ -526,28 +536,15 @@ async def voice_stream(request):
                             if suppress_current_assistant:
                                 suppress_current_assistant = False
                                 pending_user_text = None
+                                # Düşünme dolgusuna üretilen cevap: biriktirilmiş
+                                # parçalar varsa kaydetmeden at.
                                 turn_user_text = None
-                                assistant_text_chunks = []
+                                pending_assistant_chunks = []
                                 barge_in.record_suppressed_response()
                                 await ws.send_json({"type": "listening"})
                                 continue
                             barge_in.record_agent_done()
-                            if turn_user_text and assistant_text_chunks:
-                                full_assistant_text = " ".join(
-                                    assistant_text_chunks
-                                )
-                                persistence_task = asyncio.create_task(
-                                    persist_turn(
-                                        turn_user_text,
-                                        full_assistant_text,
-                                    )
-                                )
-                                persistence_tasks.add(persistence_task)
-                                persistence_task.add_done_callback(
-                                    track_persistence_task
-                                )
-                            turn_user_text = None
-                            assistant_text_chunks = []
+                            flush_pending_assistant_turn()
                             await ws.send_json({"type": "audio_done"})
                         elif event_type == "LatencyReport":
                             latency_event.update({

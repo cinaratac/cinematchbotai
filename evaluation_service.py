@@ -13,6 +13,7 @@ from database import (
     fail_voice_ai_evaluation,
     get_performance_metrics_averages,
     get_recording_transcript,
+    get_session_transcript,
     skip_voice_ai_evaluation,
     start_voice_ai_evaluation,
 )
@@ -66,14 +67,21 @@ logged_transcript içindeki "user" alanı canlı STT'nin kullanıcıdan anladı�
 metindir; "assistant" alanı agent cevabıdır. speech_recognition_error için
 assistant cevabını, agentın duyduğu kullanıcı metni gibi kullanma. Bu kriterde
 yalnızca audio_utterances ile "user" alanlarını karşılaştır.
-agent_audio_transcript, agent WAV'inin bağımsız STT sonucudur. Bunu yalnızca
-logged_transcript içindeki "assistant" alanıyla karşılaştır. Agentın gerçekte
-söylediği yanıtı; ilgililik, doğruluk, görev tamamlama ve bağlam kriterlerinde
-agent_audio_transcript'ten değerlendir. İki kaynak farklıysa bunu bot yanıtı
-log/TTS uyuşmazlığı olarak raporla. Ancak agent_audio_transcript'i kullanıcının
-niyeti veya kullanıcı STT hatası kanıtı olarak kullanma.
 deterministic_match_score kodla hesaplanmıştır; match_score alanına bu değeri
 aynen yaz ve kendi tahmininle değiştirme.
+
+agent_audio_transcript, agent'ın gerçekte söylediği sesin (agent WAV kaydının)
+bağımsız STT çıktısıdır — logged_transcript'teki "assistant" alanından
+BAĞIMSIZ, ayrı bir kaynaktır. Eğer agent_audio_transcript mevcutsa, her tur
+için logged_transcript.assistant ile agent_audio_transcript'i karşılaştır;
+agent'ın sesle gerçekte söylediği ile logaki metin belirgin şekilde
+uyuşmuyorsa (ör. log eksik/kesik, log'da olmayan bir cümle sesle söylenmiş)
+bunu transcript_comparison.mismatches içine "audio_says" alanına ses
+kaydından alıntı, "agent_understood" alanına logdaki metinden alıntı olacak
+şekilde ekle ve issues içinde "log_fidelity_error" tipiyle raporla. Bu durumda
+raporun agent tarafındaki puanlamayı agent_audio_transcript'e göre yap; loga
+değil sese güven, çünkü log eksik olabilir. agent_audio_transcript
+gönderilmemişse (agent_audio_available=false) bu karşılaştırmayı atla.
 
 PUAN KALİBRASYONU:
 - 9-10: Tam veya tama yakın başarı.
@@ -334,6 +342,88 @@ def _transcript_match_score(audio_text, logged_user_texts):
     )
 
 
+def _contains_quoted_evidence(source_text, claimed_text):
+    source = _normalize_transcript(source_text)
+    claimed = _normalize_transcript(claimed_text)
+    return bool(claimed and len(claimed.split()) >= 2 and claimed in source)
+
+
+def _has_evidence_overlap(source_text, evidence):
+    """Serbest kanıtta kaynak dökümden en az bir gerçek iki kelimelik parça ara."""
+    source_words = _normalize_transcript(source_text).split()
+    evidence_words = _normalize_transcript(evidence).split()
+    if len(evidence_words) < 2:
+        return False
+    source_pairs = set(zip(source_words, source_words[1:]))
+    return any(
+        pair in source_pairs
+        for pair in zip(evidence_words, evidence_words[1:])
+    )
+
+
+def _validate_qa_evidence(result, audio_text, turns, agent_audio_text=""):
+    """LLM kanıtlarını doğrula; geçersiz tek bulgu tüm raporu bozmasın.
+
+    audio_text: kullanıcı WAV'ının bağımsız STT çıktısı.
+    agent_audio_text: agent WAV'ının bağımsız STT çıktısı (mevcutsa).
+    turns: logged_transcript (canlı sırada DB'ye yazılan user/assistant metni).
+    """
+    if not isinstance(result, dict):
+        raise ValueError("QA sonucu nesne değil.")
+    logged_users = " ".join(
+        str(turn.get("user") or "") for turn in turns
+    )
+    logged_assistants = " ".join(
+        str(turn.get("assistant") or "") for turn in turns
+    )
+    # "audio_says" hem kullanıcı hem agent WAV'ından gelen bağımsız STT
+    # metnine dayanabilir; "agent_understood" ise loglanan (DB'deki) metne.
+    independent_audio = " ".join([audio_text, agent_audio_text])
+    logged_all = " ".join([logged_users, logged_assistants])
+    all_transcript = " ".join([independent_audio, logged_all])
+    comparison = result.get("transcript_comparison") or {}
+    valid_mismatches = []
+    for mismatch in comparison.get("mismatches") or []:
+        if not isinstance(mismatch, dict):
+            print("Voice QA geçersiz uyuşmazlık atlandı: nesne değil.")
+            continue
+        audio_says = mismatch.get("audio_says")
+        agent_understood = mismatch.get("agent_understood")
+        if not (
+            _contains_quoted_evidence(independent_audio, audio_says)
+            and _contains_quoted_evidence(logged_all, agent_understood)
+        ):
+            print(
+                "Voice QA kanıtsız STT uyuşmazlığı atlandı:",
+                f"audio={audio_says!r}, logged={agent_understood!r}",
+            )
+            continue
+        valid_mismatches.append(mismatch)
+    comparison["mismatches"] = valid_mismatches
+    result["transcript_comparison"] = comparison
+
+    valid_issues = []
+    for issue in result.get("issues") or []:
+        if not isinstance(issue, dict):
+            print("Voice QA geçersiz issue atlandı: nesne değil.")
+            continue
+        if not _has_evidence_overlap(all_transcript, issue.get("evidence")):
+            print(
+                "Voice QA kanıtsız issue atlandı:",
+                f"{issue.get('evidence')!r}",
+            )
+            continue
+        if (
+            issue.get("type") == "speech_recognition_error"
+            and not valid_mismatches
+        ):
+            print("Voice QA kanıtsız STT issue atlandı.")
+            continue
+        valid_issues.append(issue)
+    result["issues"] = valid_issues
+    return result
+
+
 def _validate_result(result):
     if not isinstance(result, dict):
         raise ValueError("Değerlendirme sonucu nesne değil.")
@@ -393,11 +483,12 @@ def _validate_result(result):
 
 
 async def _transcribe_recording(recording_id, track="user"):
-    """Firebase Storage'daki user/agent WAV kaydını bağımsız yazıya çevir."""
+    """Firebase'deki gerçek WAV kaydını (kullanıcı veya agent) bağımsız
+    olarak yazıya çevir. track: 'user' veya 'agent'."""
+    if track not in {"user", "agent"}:
+        raise ValueError("track yalnızca 'user' veya 'agent' olabilir.")
     if not DEEPGRAM_API_KEY:
         raise RuntimeError("DEEPGRAM_API_KEY tanımlı değil.")
-    if track not in {"user", "agent"}:
-        raise ValueError("QA STT track değeri user veya agent olmalıdır.")
     audio_bytes = await asyncio.to_thread(
         download_voice_recording_audio,
         recording_id,
@@ -519,7 +610,16 @@ async def _call_deepgram_evaluator_once(payload, provider_type, model):
                             return json.loads(arguments)
                     raise RuntimeError("QA agentı beklenmeyen bir function çağırdı.")
                 elif event_type == "ConversationText" and event.get("role") == "assistant":
-                    return _extract_json(event.get("content"))
+                    # Model function-call yapmak yerine serbest metin
+                    # döndürdü. Bunu JSON'a zorlayıp kabul etmek, kanıtsız/
+                    # yapılandırılmamış çıktının rapora sızmasına yol açar.
+                    # Bunun yerine hata say; çağıran taraf yeniden dener
+                    # veya bir sonraki modele düşer.
+                    preview = str(event.get("content") or "")[:200]
+                    raise RuntimeError(
+                        "QA agentı submit_evaluation çağırmadı, serbest "
+                        f"metin döndürdü: {preview!r}"
+                    )
                 elif event_type == "Error":
                     detail = event.get("description") or event.get("message") or "Deepgram evaluator hatası."
                     raise RuntimeError(detail)
@@ -570,6 +670,7 @@ async def evaluate_voice_session(
     session_id,
     recording_id,
     wait_for_idle=True,
+    allow_session_fallback=True,
     idle_grace_seconds=15,
 ):
     provider_chain = list(dict.fromkeys([
@@ -596,39 +697,47 @@ async def evaluate_voice_session(
         transcript = await asyncio.to_thread(
             get_recording_transcript, recording_id, 100
         )
+        # Otomatik QA eski kayıt uyumluluğu için oturum fallback'i kullanır.
+        # Admin tekrar değerlendirmesinde bu fallback seçili WAV ile ilgisiz
+        # son konuşma turlarını eşleştirebildiği için bilinçli olarak kapatılır.
+        if not transcript and allow_session_fallback:
+            transcript = await asyncio.to_thread(
+                get_session_transcript, session_id, 20
+            )
         if not transcript:
             await asyncio.to_thread(
                 skip_voice_ai_evaluation,
                 recording_id,
-                "Bu ses kaydına bağlı konuşma turu bulunamadı; başka "
-                "oturum verisiyle değerlendirme yapılmadı.",
+                "Görüşmede değerlendirilecek transkript oluşmadı.",
             )
             print(
-                "Voice AI değerlendirmesi atlandı; kayıtla bağlı transkript yok:",
+                "Voice AI değerlendirmesi atlandı; transkript yok:",
                 recording_id,
             )
             return
-        print(
-            "Voice QA giriş verisi doğrulandı:",
-            f"recording_id={recording_id}",
-            f"linked_turns={len(transcript)}",
-            "source=recording_id",
-        )
-        audio_result, agent_audio_result = await asyncio.gather(
-            _transcribe_recording(recording_id, "user"),
-            _transcribe_recording(recording_id, "agent"),
-            return_exceptions=True,
-        )
-        if isinstance(audio_result, Exception):
-            raise audio_result
-        if isinstance(agent_audio_result, Exception):
-            print(
-                "Voice QA agent WAV yeniden transkript edilemedi; "
-                "mevcut logged transcript kullanılacak:",
-                repr(agent_audio_result),
-            )
-            agent_audio_result = None
+        audio_result = await _transcribe_recording(recording_id, "user")
         audio_transcript = audio_result["transcript"]
+
+        agent_audio_transcript = ""
+        agent_audio_utterances = []
+        agent_audio_available = False
+        try:
+            agent_audio_result = await _transcribe_recording(
+                recording_id, "agent"
+            )
+            agent_audio_transcript = agent_audio_result["transcript"]
+            agent_audio_utterances = agent_audio_result["utterances"]
+            agent_audio_available = True
+        except Exception as agent_audio_error:
+            # Agent WAV'ı olmayan eski kayıtlar için değerlendirmeyi
+            # tamamen durdurmuyoruz; kullanıcı sesi üzerinden değerlendirme
+            # devam eder, sadece agent tarafı bağımsız doğrulanamaz.
+            print(
+                "Voice QA agent ses kaydı transkript edilemedi:",
+                recording_id,
+                repr(agent_audio_error),
+            )
+
         performance = await asyncio.to_thread(
             get_performance_metrics_averages,
             200,
@@ -661,30 +770,23 @@ async def evaluate_voice_session(
             audio_transcript,
             logged_user_texts,
         )
-        agent_audio_transcript = (
-            agent_audio_result["transcript"] if agent_audio_result else ""
-        )
-        deterministic_agent_match_score = (
+        agent_deterministic_match_score = (
             _transcript_match_score(
-                agent_audio_transcript,
-                logged_assistant_texts,
+                agent_audio_transcript, logged_assistant_texts
             )
-            if agent_audio_transcript and logged_assistant_texts
+            if agent_audio_available
             else None
         )
         evaluation_payload = {
             "criteria": CRITERIA,
             "audio_transcript": audio_transcript,
             "audio_utterances": audio_result["utterances"],
-            "agent_audio_transcript": agent_audio_transcript or None,
-            "agent_audio_utterances": (
-                agent_audio_result["utterances"]
-                if agent_audio_result
-                else []
-            ),
+            "agent_audio_available": agent_audio_available,
+            "agent_audio_transcript": agent_audio_transcript,
+            "agent_audio_utterances": agent_audio_utterances,
             "logged_transcript": turns,
             "deterministic_match_score": deterministic_match_score,
-            "deterministic_agent_match_score": deterministic_agent_match_score,
+            "agent_deterministic_match_score": agent_deterministic_match_score,
             "performance_metrics_ms": performance_summary,
             "barge_in_metrics": {
                 "average_latency_ms": performance_summary.get(
@@ -734,18 +836,25 @@ async def evaluate_voice_session(
                     or issue.get("type") != "speech_recognition_error"
                 )
             ]
+        # Kanıtsız (transkriptte geçmeyen) uyuşmazlık/issue'ları filtrele.
+        # Bu adım daha önce tanımlıydı ama hiç çağrılmıyordu.
+        raw_result = _validate_qa_evidence(
+            raw_result,
+            audio_transcript,
+            turns,
+            agent_audio_text=agent_audio_transcript,
+        )
         result = _validate_result(raw_result)
         result["evaluator_provider"] = used_provider
         result["evaluator_model"] = used_model
         result["audio_transcript"] = audio_transcript
         result["logged_user_transcript"] = logged_user_texts
-        result["agent_audio_transcript"] = agent_audio_transcript or None
+        result["agent_audio_available"] = agent_audio_available
+        result["agent_audio_transcript"] = agent_audio_transcript
         result["logged_assistant_transcript"] = logged_assistant_texts
-        result["deterministic_agent_match_score"] = (
-            deterministic_agent_match_score
+        result["agent_deterministic_match_score"] = (
+            agent_deterministic_match_score
         )
-        result["qa_input_source"] = "recording_id"
-        result["qa_input_turn_count"] = len(turns)
         await asyncio.to_thread(
             complete_voice_ai_evaluation, recording_id, result
         )
@@ -768,6 +877,7 @@ def _create_voice_evaluation_task(
     session_id,
     recording_id,
     wait_for_idle=True,
+    allow_session_fallback=True,
     idle_grace_seconds=15,
 ):
     """Bu fonksiyon mutlaka çalışan bir asyncio loop'u içinde çağrılmalıdır."""
@@ -777,6 +887,7 @@ def _create_voice_evaluation_task(
             session_id,
             recording_id,
             wait_for_idle,
+            allow_session_fallback,
             idle_grace_seconds,
         ),
         name=f"voice-evaluation-{recording_id}",
@@ -800,6 +911,7 @@ def schedule_voice_evaluation(
     session_id,
     recording_id,
     wait_for_idle=True,
+    allow_session_fallback=True,
     idle_grace_seconds=15,
 ):
     """QA işini aktif loop'ta veya WSGI'den ana aiohttp loop'unda başlatır."""
@@ -816,6 +928,7 @@ def schedule_voice_evaluation(
                 session_id,
                 recording_id,
                 wait_for_idle,
+                allow_session_fallback,
                 idle_grace_seconds,
             ), loop
         )
@@ -823,6 +936,7 @@ def schedule_voice_evaluation(
         session_id,
         recording_id,
         wait_for_idle,
+        allow_session_fallback,
         idle_grace_seconds,
     )
 
@@ -831,11 +945,13 @@ async def _schedule_voice_evaluation_on_loop(
     session_id,
     recording_id,
     wait_for_idle,
+    allow_session_fallback,
     idle_grace_seconds,
 ):
     return _create_voice_evaluation_task(
         session_id,
         recording_id,
         wait_for_idle,
+        allow_session_fallback,
         idle_grace_seconds,
     )
