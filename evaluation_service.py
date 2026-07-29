@@ -146,6 +146,21 @@ Her logged_transcript turu için aynı turn_index ile turns dizisinde bir kayıt
 oluştur. Sorunsuz turda issues boş liste ve notable=false olmalıdır.
 Barge-in metriği varsa barge_in_handling kriterini bu ölçüme dayanarak puanla;
 yoksa gözlenemedi olarak bırak.
+
+ZORUNLU KAYNAK KURALI: Bu QA için tek gerçek kaynak payload içindeki
+audio_transcript ve logged_transcript alanlarıdır. Dünya bilgini, varsayımını,
+örnek konuşmaları veya başka oturumları kullanma. Bir şehir, film, kişi, sayı,
+araç çağrısı ya da konu bu alanlarda açıkça geçmiyorsa rapora kesinlikle yazma.
+Örneğin dökümde hava durumu geçmiyorsa hava durumuna ilişkin hiçbir puan,
+issue, güçlü yön veya öneri üretme.
+
+Her observed=true kriterinin reason alanı `Turn <numara>: "tam alıntı" —`
+ile başlamalıdır; alıntı logged_transcript'teki ilgili turdan harfiyen
+alınmalıdır. Böyle bir alıntı yoksa observed=false ve score=null kullan.
+Her issue.evidence alanı da gerçek bir turn alıntısı olmalıdır. Önce turn'leri
+ve alıntıları içinden belirle, sonra yalnızca bunlara dayanarak raporla.
+İki transkriptin farklı olması QA'nın inceleme konusudur; onları eşit kabul
+etme veya fark gördüğün için raporu reddetme.
 """.strip()
 
 
