@@ -64,6 +64,10 @@ cevabın yönü değişiyorsa raporlanmalıdır. Kanıt alanında iki taraftaki 
 ifadeyi aynen göster; transkriptte bulunmayan ifade uydurma.
 audio_says ve agent_understood aynı ifadeyse veya yalnızca biçimsel fark
 taşıyorsa transcript_comparison.mismatches dizisini boş bırak.
+Gerçek kullanıcı sesi ile agentın anladığı metin aynıysa ve anlamı değiştiren
+bir STT hatası yoksa mismatches ve speech_recognition_error issue dizilerini
+KESİNLİKLE boş bırak ([]). Şema alanını doldurmak için aynı metni iki kez
+yazarak sahte uyuşmazlık üretme.
 logged_transcript içindeki "user" alanı canlı STT'nin kullanıcıdan anladığı
 metindir; "assistant" alanı agent cevabıdır. speech_recognition_error için
 assistant cevabını, agentın duyduğu kullanıcı metni gibi kullanma. Bu kriterde
@@ -340,6 +344,60 @@ def _transcript_match_score(audio_text, logged_user_texts):
     return round(
         SequenceMatcher(None, audio_words, logged_words).ratio() * 100
     )
+
+
+def _contains_quoted_evidence(source_text, claimed_text):
+    source = _normalize_transcript(source_text)
+    claimed = _normalize_transcript(claimed_text)
+    return bool(claimed and len(claimed.split()) >= 2 and claimed in source)
+
+
+def _validate_qa_evidence(result, audio_text, turns, agent_audio_text=""):
+    """Sahte STT maddelerini sessizce çıkar; QA raporunu asla durdurma."""
+    if not isinstance(result, dict):
+        return result
+
+    logged_users = " ".join(
+        str(turn.get("user") or "") for turn in turns
+    )
+    logged_assistants = " ".join(
+        str(turn.get("assistant") or "") for turn in turns
+    )
+    independent_audio = " ".join([audio_text, agent_audio_text])
+    logged_all = " ".join([logged_users, logged_assistants])
+    comparison = result.get("transcript_comparison") or {}
+    valid_mismatches = []
+
+    for mismatch in comparison.get("mismatches") or []:
+        if not isinstance(mismatch, dict):
+            continue
+        audio_says = str(mismatch.get("audio_says") or "")
+        agent_understood = str(mismatch.get("agent_understood") or "")
+        # Aynı cümle bir uyuşmazlık değildir; LLM şemayı doldurmak için bunu
+        # üretse bile rapora taşıma.
+        if _normalize_transcript(audio_says) == _normalize_transcript(
+            agent_understood
+        ):
+            continue
+        if not (
+            _contains_quoted_evidence(independent_audio, audio_says)
+            and _contains_quoted_evidence(logged_all, agent_understood)
+        ):
+            continue
+        valid_mismatches.append(mismatch)
+
+    comparison["mismatches"] = valid_mismatches
+    result["transcript_comparison"] = comparison
+    result["issues"] = [
+        issue
+        for issue in result.get("issues") or []
+        if not (
+            isinstance(issue, dict)
+            and issue.get("type") == "speech_recognition_error"
+            and not valid_mismatches
+        )
+    ]
+    return result
 
 
 def _validate_result(result):
@@ -753,6 +811,12 @@ async def evaluate_voice_session(
                     or issue.get("type") != "speech_recognition_error"
                 )
             ]
+        raw_result = _validate_qa_evidence(
+            raw_result,
+            audio_transcript,
+            turns,
+            agent_audio_text=agent_audio_transcript,
+        )
         result = _validate_result(raw_result)
         result["evaluator_provider"] = used_provider
         result["evaluator_model"] = used_model
