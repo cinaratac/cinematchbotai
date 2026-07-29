@@ -63,11 +63,7 @@ Hata ancak kullanıcının niyeti, varlık adı, sayı, olumsuzluk, tercih veya
 cevabın yönü değişiyorsa raporlanmalıdır. Kanıt alanında iki taraftaki gerçek
 ifadeyi aynen göster; transkriptte bulunmayan ifade uydurma.
 audio_says ve agent_understood aynı ifadeyse veya yalnızca biçimsel fark
-taşıyorsa transcript_comparison.mismatches dizisini boş bırak.
-Gerçek kullanıcı sesi ile agentın anladığı metin aynıysa ve anlamı değiştiren
-bir STT hatası yoksa mismatches ve speech_recognition_error issue dizilerini
-KESİNLİKLE boş bırak ([]). Şema alanını doldurmak için aynı metni iki kez
-yazarak sahte uyuşmazlık üretme.
+taşıyorsa bu bir uyuşmazlık değildir.
 logged_transcript içindeki "user" alanı canlı STT'nin kullanıcıdan anladığı
 metindir; "assistant" alanı agent cevabıdır. speech_recognition_error için
 assistant cevabını, agentın duyduğu kullanıcı metni gibi kullanma. Bu kriterde
@@ -168,14 +164,26 @@ yoksa gözlenemedi olarak bırak.
 ZORUNLU KAYNAK KURALI: Bu QA için tek gerçek kaynak payload içindeki
 audio_transcript, agent_audio_transcript ve logged_transcript alanlarıdır.
 Dünya bilgini, varsayımını, örnek konuşmaları veya başka oturumları kullanma.
-Bu alanlarda açıkça geçmeyen hiçbir konu, kişi, film, yer, sayı veya olay
-rapora yazılamaz.
+Bu alanlarda açıkça geçmeyen hiçbir konu, özel ad, yer, sayı veya olay rapora
+yazılamaz.
 
-Her observed=true kriterinin reason alanı `Turn <numara>: "tam alıntı" —`
-ile başlamalıdır; alıntı payload'daki gerçek kaynak metinden harfiyen
-alınmalıdır. Böyle bir alıntı yoksa observed=false ve score=null kullan.
-Her issue.evidence alanı da gerçek bir turn alıntısı olmalıdır. Önce turn'leri
-ve alıntıları içinden belirle, sonra yalnızca bunlara dayanarak raporla.
+🚨 KESİN KURAL: KANIT ZORUNLULUĞU VE BOŞ DİZİ KULLANIMI 🚨
+
+1. BOŞ BIRAKMA İZNİ: Eğer kullanıcı sesi ile agentın anladığı metin aynıysa,
+`transcript_comparison.mismatches` dizisini KESİNLİKLE BOŞ BIRAK (`[]`).
+2. YASAKLI DAVRANIŞ: Sırf alanı doldurmak için aynı metni iki kez yazma.
+YANLIŞ KULLANIM: `"audio_says": "kırmızı araba",
+"agent_understood": "kırmızı araba"` — ikisi aynıysa uyuşmazlık değildir;
+diziyi boş bırak.
+3. REASON ALANI DENETİMİ: Kriterleri puanlarken `reason` alanına yazdığın ve
+tırnak içine aldığın HER KELİME, sana verilen gerçek kaynak metinlerde HARFİ
+HARFİNE geçmek zorundadır. Her observed=true kriterinin reason alanı
+`Turn <numara>: "tam alıntı" —` ile başlamalıdır. Gerçek alıntı yoksa
+observed=false ve score=null kullan.
+4. Gerçek kaynak metinlerde bulunmayan hayali cümleleri `reason`,
+`issues.evidence`, `strengths` veya `prompt_recommendations.evidence`
+alanlarında kanıt olarak YAZAMAZSIN.
+
 İki transkriptin farklı olması QA'nın inceleme konusudur; onları eşit kabul
 etme veya fark gördüğün için raporu reddetme.
 """.strip()
