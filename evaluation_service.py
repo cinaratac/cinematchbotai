@@ -360,8 +360,28 @@ def _contains_quoted_evidence(source_text, claimed_text):
     return bool(claimed and len(claimed.split()) >= 2 and claimed in source)
 
 
+def _has_evidence_overlap(source_text, evidence):
+    source_words = _normalize_transcript(source_text).split()
+    evidence_words = _normalize_transcript(evidence).split()
+    if len(evidence_words) < 2:
+        return False
+    source_pairs = set(zip(source_words, source_words[1:]))
+    return any(
+        pair in source_pairs
+        for pair in zip(evidence_words, evidence_words[1:])
+    )
+
+
+def _reason_has_source_quote(source_text, reason):
+    quotes = re.findall(r'["“]([^"”]+)["”]', str(reason or ""))
+    return any(
+        _contains_quoted_evidence(source_text, quote)
+        for quote in quotes
+    )
+
+
 def _validate_qa_evidence(result, audio_text, turns, agent_audio_text=""):
-    """Sahte STT maddelerini sessizce çıkar; QA raporunu asla durdurma."""
+    """Kaynak dışı kanıtları temizle; QA raporunu kaynak dışı iddiayla bozma."""
     if not isinstance(result, dict):
         return result
 
@@ -373,6 +393,7 @@ def _validate_qa_evidence(result, audio_text, turns, agent_audio_text=""):
     )
     independent_audio = " ".join([audio_text, agent_audio_text])
     logged_all = " ".join([logged_users, logged_assistants])
+    all_transcript = " ".join([independent_audio, logged_all])
     comparison = result.get("transcript_comparison") or {}
     valid_mismatches = []
 
@@ -399,12 +420,47 @@ def _validate_qa_evidence(result, audio_text, turns, agent_audio_text=""):
     result["issues"] = [
         issue
         for issue in result.get("issues") or []
-        if not (
+        if (
             isinstance(issue, dict)
-            and issue.get("type") == "speech_recognition_error"
-            and not valid_mismatches
+            and _has_evidence_overlap(all_transcript, issue.get("evidence"))
         )
     ]
+
+    # Model, criteria.reason alanına prompt içinden veya kendi bilgisinden
+    # sahte bir alıntı taşıyabilir. Böyle bir kriter gözlenmiş sayılamaz;
+    # diğer kriterleri ve transcript karşılaştırmasını değiştirmiyoruz.
+    criteria = result.get("criteria") or {}
+    for item in criteria.values():
+        if not isinstance(item, dict) or item.get("observed") is not True:
+            continue
+        if _reason_has_source_quote(all_transcript, item.get("reason")):
+            continue
+        item["observed"] = False
+        item["score"] = None
+        item["reason"] = "Kaynak metinlerde doğrulanabilir kanıt bulunamadı."
+
+    result["strengths"] = [
+        strength
+        for strength in result.get("strengths") or []
+        if _has_evidence_overlap(all_transcript, strength)
+    ]
+    result["prompt_recommendations"] = [
+        recommendation
+        for recommendation in result.get("prompt_recommendations") or []
+        if (
+            isinstance(recommendation, dict)
+            and _has_evidence_overlap(
+                all_transcript, recommendation.get("evidence")
+            )
+        )
+    ]
+    for turn in result.get("turns") or []:
+        if isinstance(turn, dict):
+            turn["issues"] = [
+                issue
+                for issue in turn.get("issues") or []
+                if _has_evidence_overlap(all_transcript, issue)
+            ]
     return result
 
 
