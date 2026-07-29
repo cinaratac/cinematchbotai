@@ -67,6 +67,12 @@ logged_transcript içindeki "user" alanı canlı STT'nin kullanıcıdan anladı�
 metindir; "assistant" alanı agent cevabıdır. speech_recognition_error için
 assistant cevabını, agentın duyduğu kullanıcı metni gibi kullanma. Bu kriterde
 yalnızca audio_utterances ile "user" alanlarını karşılaştır.
+agent_audio_transcript, agent WAV'inin bağımsız STT sonucudur. Bunu yalnızca
+logged_transcript içindeki "assistant" alanıyla karşılaştır. Agentın gerçekte
+söylediği yanıtı; ilgililik, doğruluk, görev tamamlama ve bağlam kriterlerinde
+agent_audio_transcript'ten değerlendir. İki kaynak farklıysa bunu bot yanıtı
+log/TTS uyuşmazlığı olarak raporla. Ancak agent_audio_transcript'i kullanıcının
+niyeti veya kullanıcı STT hatası kanıtı olarak kullanma.
 deterministic_match_score kodla hesaplanmıştır; match_score alanına bu değeri
 aynen yaz ve kendi tahmininle değiştirme.
 
@@ -329,83 +335,6 @@ def _transcript_match_score(audio_text, logged_user_texts):
     )
 
 
-def _contains_quoted_evidence(source_text, claimed_text):
-    source = _normalize_transcript(source_text)
-    claimed = _normalize_transcript(claimed_text)
-    return bool(claimed and len(claimed.split()) >= 2 and claimed in source)
-
-
-def _has_evidence_overlap(source_text, evidence):
-    """Serbest kanıtta kaynak dökümden en az bir gerçek iki kelimelik parça ara."""
-    source_words = _normalize_transcript(source_text).split()
-    evidence_words = _normalize_transcript(evidence).split()
-    if len(evidence_words) < 2:
-        return False
-    source_pairs = set(zip(source_words, source_words[1:]))
-    return any(
-        pair in source_pairs
-        for pair in zip(evidence_words, evidence_words[1:])
-    )
-
-
-def _validate_qa_evidence(result, audio_text, turns):
-    """LLM kanıtlarını doğrula; geçersiz tek bulgu tüm raporu bozmasın."""
-    if not isinstance(result, dict):
-        raise ValueError("QA sonucu nesne değil.")
-    logged_users = " ".join(
-        str(turn.get("user") or "") for turn in turns
-    )
-    all_transcript = " ".join([
-        audio_text,
-        logged_users,
-        *(
-            str(turn.get("assistant") or "")
-            for turn in turns
-        ),
-    ])
-    comparison = result.get("transcript_comparison") or {}
-    valid_mismatches = []
-    for mismatch in comparison.get("mismatches") or []:
-        if not isinstance(mismatch, dict):
-            print("Voice QA geçersiz uyuşmazlık atlandı: nesne değil.")
-            continue
-        audio_says = mismatch.get("audio_says")
-        agent_understood = mismatch.get("agent_understood")
-        if not (
-            _contains_quoted_evidence(audio_text, audio_says)
-            and _contains_quoted_evidence(logged_users, agent_understood)
-        ):
-            print(
-                "Voice QA kanıtsız STT uyuşmazlığı atlandı:",
-                f"audio={audio_says!r}, logged={agent_understood!r}",
-            )
-            continue
-        valid_mismatches.append(mismatch)
-    comparison["mismatches"] = valid_mismatches
-    result["transcript_comparison"] = comparison
-
-    valid_issues = []
-    for issue in result.get("issues") or []:
-        if not isinstance(issue, dict):
-            print("Voice QA geçersiz issue atlandı: nesne değil.")
-            continue
-        if not _has_evidence_overlap(all_transcript, issue.get("evidence")):
-            print(
-                "Voice QA kanıtsız issue atlandı:",
-                f"{issue.get('evidence')!r}",
-            )
-            continue
-        if (
-            issue.get("type") == "speech_recognition_error"
-            and not valid_mismatches
-        ):
-            print("Voice QA kanıtsız STT issue atlandı.")
-            continue
-        valid_issues.append(issue)
-    result["issues"] = valid_issues
-    return result
-
-
 def _validate_result(result):
     if not isinstance(result, dict):
         raise ValueError("Değerlendirme sonucu nesne değil.")
@@ -464,17 +393,19 @@ def _validate_result(result):
     return result
 
 
-async def _transcribe_recording(recording_id):
-    """Firebase'deki gerçek kullanıcı WAV kaydını bağımsız olarak yazıya çevir."""
+async def _transcribe_recording(recording_id, track="user"):
+    """Firebase Storage'daki user/agent WAV kaydını bağımsız yazıya çevir."""
     if not DEEPGRAM_API_KEY:
         raise RuntimeError("DEEPGRAM_API_KEY tanımlı değil.")
+    if track not in {"user", "agent"}:
+        raise ValueError("QA STT track değeri user veya agent olmalıdır.")
     audio_bytes = await asyncio.to_thread(
         download_voice_recording_audio,
         recording_id,
-        "user",
+        track,
     )
     if not audio_bytes:
-        raise RuntimeError("Kullanıcı ses kaydı boş.")
+        raise RuntimeError(f"{track} ses kaydı boş.")
     timeout = aiohttp.ClientTimeout(total=180)
     params = {
         "model": "nova-3",
@@ -509,10 +440,13 @@ async def _transcribe_recording(recording_id):
         else ""
     )
     if not transcript:
-        raise RuntimeError("Ses kaydından bağımsız transkript çıkarılamadı.")
+        raise RuntimeError(
+            f"{track} ses kaydından bağımsız transkript çıkarılamadı."
+        )
     print(
         "Voice QA ses kaydı yeniden transkript edildi:",
         recording_id,
+        f"track={track}",
         f"chars={len(transcript)}",
     )
     utterances = [
@@ -682,7 +616,20 @@ async def evaluate_voice_session(
                 recording_id,
             )
             return
-        audio_result = await _transcribe_recording(recording_id)
+        audio_result, agent_audio_result = await asyncio.gather(
+            _transcribe_recording(recording_id, "user"),
+            _transcribe_recording(recording_id, "agent"),
+            return_exceptions=True,
+        )
+        if isinstance(audio_result, Exception):
+            raise audio_result
+        if isinstance(agent_audio_result, Exception):
+            print(
+                "Voice QA agent WAV yeniden transkript edilemedi; "
+                "mevcut logged transcript kullanılacak:",
+                repr(agent_audio_result),
+            )
+            agent_audio_result = None
         audio_transcript = audio_result["transcript"]
         performance = await asyncio.to_thread(
             get_performance_metrics_averages,
@@ -709,16 +656,37 @@ async def evaluate_voice_session(
         logged_user_texts = [
             turn["user"] for turn in turns if turn.get("user")
         ]
+        logged_assistant_texts = [
+            turn["assistant"] for turn in turns if turn.get("assistant")
+        ]
         deterministic_match_score = _transcript_match_score(
             audio_transcript,
             logged_user_texts,
+        )
+        agent_audio_transcript = (
+            agent_audio_result["transcript"] if agent_audio_result else ""
+        )
+        deterministic_agent_match_score = (
+            _transcript_match_score(
+                agent_audio_transcript,
+                logged_assistant_texts,
+            )
+            if agent_audio_transcript and logged_assistant_texts
+            else None
         )
         evaluation_payload = {
             "criteria": CRITERIA,
             "audio_transcript": audio_transcript,
             "audio_utterances": audio_result["utterances"],
+            "agent_audio_transcript": agent_audio_transcript or None,
+            "agent_audio_utterances": (
+                agent_audio_result["utterances"]
+                if agent_audio_result
+                else []
+            ),
             "logged_transcript": turns,
             "deterministic_match_score": deterministic_match_score,
+            "deterministic_agent_match_score": deterministic_agent_match_score,
             "performance_metrics_ms": performance_summary,
             "barge_in_metrics": {
                 "average_latency_ms": performance_summary.get(
@@ -773,6 +741,11 @@ async def evaluate_voice_session(
         result["evaluator_model"] = used_model
         result["audio_transcript"] = audio_transcript
         result["logged_user_transcript"] = logged_user_texts
+        result["agent_audio_transcript"] = agent_audio_transcript or None
+        result["logged_assistant_transcript"] = logged_assistant_texts
+        result["deterministic_agent_match_score"] = (
+            deterministic_agent_match_score
+        )
         await asyncio.to_thread(
             complete_voice_ai_evaluation, recording_id, result
         )
