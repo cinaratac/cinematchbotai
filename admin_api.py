@@ -24,6 +24,7 @@ from functools import wraps
 from flask import Blueprint, jsonify, redirect, render_template, request
 
 import database as db
+from evaluation_service import EVALUATION_MODEL, schedule_voice_evaluation
 
 admin_bp = Blueprint("admin_bp", __name__, url_prefix="/api/admin")
 
@@ -245,3 +246,57 @@ def download_voice_recording(recording_id, track):
             "message": "Hazır ses kaydı bulunamadı.",
         }), 404
     return redirect(download_url, code=302)
+
+
+@admin_bp.route(
+    "/voice-recordings/<recording_id>/qa/re-evaluate",
+    methods=["POST"],
+)
+@require_admin_key
+def re_evaluate_voice_recording(recording_id):
+    """Hazır bir WAV kaydı için QA hattını admin isteğiyle yeniden çalıştır."""
+    recording = db.get_voice_recording_for_qa(recording_id)
+    if not recording:
+        return jsonify({
+            "status": "error",
+            "message": "Ses kaydı bulunamadı.",
+        }), 404
+    if recording.get("status") != "ready":
+        return jsonify({
+            "status": "error",
+            "message": "Yalnızca hazır durumdaki ses kayıtları yeniden değerlendirilebilir.",
+        }), 409
+    if not recording.get("session_id") or not recording.get("user_storage_path"):
+        return jsonify({
+            "status": "error",
+            "message": "Kayıt QA için gerekli session veya kullanıcı sesi bilgisini içermiyor.",
+        }), 409
+
+    current_status = db.get_voice_ai_evaluation_status(recording_id)
+    if current_status in {"queued", "processing"}:
+        return jsonify({
+            "status": "error",
+            "message": "Bu kayıt için zaten çalışan bir değerlendirme var.",
+        }), 409
+
+    model_chain = f"openai/{EVALUATION_MODEL} -> openai/gpt-4o"
+    db.queue_voice_ai_evaluation(
+        recording["session_id"], recording_id, model_chain
+    )
+    try:
+        schedule_voice_evaluation(recording["session_id"], recording_id)
+    except Exception as exc:
+        db.fail_voice_ai_evaluation(recording_id, exc)
+        return jsonify({
+            "status": "error",
+            "message": "Değerlendirme kuyruğa alınamadı.",
+        }), 503
+
+    return jsonify({
+        "status": "accepted",
+        "data": {
+            "recording_id": recording_id,
+            "session_id": recording["session_id"],
+            "evaluation_status": "queued",
+        },
+    }), 202

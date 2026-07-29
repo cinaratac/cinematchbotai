@@ -35,6 +35,7 @@ if not EVALUATION_MODEL.startswith("gpt-"):
     )
     EVALUATION_MODEL = "gpt-4o-mini"
 EVALUATION_TASKS = set()
+VOICE_EVALUATION_LOOP = None
 QA_EVALUATOR_VERSION = "openai-responses-json-schema-v1"
 STT_REFERENCE_VERSION = "deepgram-nova-3-tr"
 TRANSCRIPT_METRIC_VERSION = "wer-token-v1"
@@ -832,8 +833,14 @@ async def evaluate_voice_session(session_id, recording_id):
             print("Değerlendirme hata kaydı yazılamadı:", repr(persist_exc))
 
 
-def schedule_voice_evaluation(session_id, recording_id):
-    """WebSocket requestinden bağımsız bir QA taskı başlatır."""
+def set_voice_evaluation_loop(loop):
+    """WSGI admin isteklerinin QA işini ana aiohttp loop'una iletmesini sağlar."""
+    global VOICE_EVALUATION_LOOP
+    VOICE_EVALUATION_LOOP = loop
+
+
+def _create_voice_evaluation_task(session_id, recording_id):
+    """Bu fonksiyon mutlaka çalışan bir asyncio loop'u içinde çağrılmalıdır."""
     print("Voice AI değerlendirmesi arka plana alındı:", recording_id)
     task = asyncio.create_task(
         evaluate_voice_session(session_id, recording_id),
@@ -852,3 +859,23 @@ def schedule_voice_evaluation(session_id, recording_id):
 
     task.add_done_callback(evaluation_done)
     return task
+
+
+def schedule_voice_evaluation(session_id, recording_id):
+    """QA işini aktif loop'ta veya WSGI'den ana aiohttp loop'unda başlatır."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        loop = VOICE_EVALUATION_LOOP
+        if loop is None or loop.is_closed():
+            raise RuntimeError(
+                "Voice QA scheduler henüz hazır değil; sunucu başlatılıyor olabilir."
+            )
+        return asyncio.run_coroutine_threadsafe(
+            _schedule_voice_evaluation_on_loop(session_id, recording_id), loop
+        )
+    return _create_voice_evaluation_task(session_id, recording_id)
+
+
+async def _schedule_voice_evaluation_on_loop(session_id, recording_id):
+    return _create_voice_evaluation_task(session_id, recording_id)

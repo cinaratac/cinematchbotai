@@ -382,6 +382,49 @@ def download_voice_recording_audio(recording_id, track="user"):
     return storage.bucket(bucket_name).blob(storage_path).download_as_bytes()
 
 
+def get_voice_recording_for_qa(recording_id):
+    """Admin kaynaklı tekrar QA isteği için kaydın güvenli metadata'sını döndür."""
+    doc = (
+        _get_db()
+        .collection(COL_VOICE_RECORDINGS)
+        .document(recording_id)
+        .get()
+    )
+    if not doc.exists:
+        return None
+    data = doc.to_dict() or {}
+    return {
+        "recording_id": doc.id,
+        "session_id": data.get("session_id"),
+        "status": data.get("status"),
+        "user_storage_path": data.get("user_storage_path"),
+        "agent_storage_path": data.get("agent_storage_path"),
+    }
+
+
+def get_voice_ai_evaluation_status(recording_id):
+    doc = (
+        _get_db()
+        .collection(COL_VOICE_AI_EVALUATIONS)
+        .document(recording_id)
+        .get()
+    )
+    if not doc.exists:
+        return None
+    return (doc.to_dict() or {}).get("status")
+
+
+def queue_voice_ai_evaluation(session_id, recording_id, model_chain):
+    """Admin'ın istediği yeniden QA işini görünür biçimde kuyruğa alır."""
+    _get_db().collection(COL_VOICE_AI_EVALUATIONS).document(recording_id).set({
+        "session_id": session_id,
+        "recording_id": recording_id,
+        "status": "queued",
+        "model_chain": model_chain,
+        "updated_at": _now(),
+    }, merge=True)
+
+
 def start_voice_ai_evaluation(session_id, recording_id, model_chain):
     ref = _get_db().collection(COL_VOICE_AI_EVALUATIONS).document(recording_id)
     ref.set({
@@ -443,13 +486,15 @@ def skip_voice_ai_evaluation(recording_id, reason):
 
 
 def cleanup_stale_voice_ai_evaluations(max_age_minutes=30):
-    """Restart sonrası processing durumunda kalmış QA işlerini kapatır."""
+    """Restart sonrası kuyruğa alınmış veya processing kalmış QA işlerini kapatır."""
     cutoff = _now() - timedelta(minutes=max_age_minutes)
-    docs = list(
-        _get_db().collection(COL_VOICE_AI_EVALUATIONS)
-        .where(filter=FieldFilter("status", "==", "processing"))
-        .stream()
-    )
+    docs = []
+    for status in ("queued", "processing"):
+        docs.extend(
+            _get_db().collection(COL_VOICE_AI_EVALUATIONS)
+            .where(filter=FieldFilter("status", "==", status))
+            .stream()
+        )
     cleaned = 0
     for doc in docs:
         data = doc.to_dict() or {}

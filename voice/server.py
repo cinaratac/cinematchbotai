@@ -28,6 +28,12 @@ def create_app():
     app.router.add_route("*", "/{path_info:.*}", WSGIHandler(main_module.app))
 
     async def start_external_services(aiohttp_app):
+        # Flask/WSGI üzerinden gelen admin yeniden-değerlendirme isteği kendi
+        # thread'inde çalışır. QA taskını voice bağlantılarının kullandığı bu
+        # ana aiohttp event loop'unda başlatmak için loop'u kaydediyoruz.
+        from evaluation_service import set_voice_evaluation_loop
+
+        set_voice_evaluation_loop(asyncio.get_running_loop())
         task = asyncio.create_task(
             asyncio.to_thread(main_module.initialize_services),
             name="cinematch-service-initialization",
