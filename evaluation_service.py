@@ -1,4 +1,5 @@
 import asyncio
+import copy
 from difflib import SequenceMatcher
 import json
 import os
@@ -22,6 +23,14 @@ from voice.activity import wait_for_voice_idle
 
 
 DEEPGRAM_API_KEY = os.environ.get("DEEPGRAM_API_KEY", "")
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_QA_MODEL = os.environ.get(
+    "VOICE_QA_OPENROUTER_MODEL", "openai/gpt-4o-mini"
+)
+OPENROUTER_QA_FALLBACK_MODEL = os.environ.get(
+    "VOICE_QA_OPENROUTER_FALLBACK_MODEL", "google/gemma-4-26b-a4b-it"
+)
 EVALUATION_MODEL = os.environ.get(
     "VOICE_EVALUATION_MODEL", "gpt-4o-mini"
 )
@@ -324,6 +333,23 @@ EVALUATION_FUNCTION = {
 }
 
 
+def _strict_json_schema(schema):
+    """OpenRouter/OpenAI structured-output uyumluluğu için şemayı sıkılaştır."""
+    result = copy.deepcopy(schema)
+    if isinstance(result, dict):
+        if result.get("type") == "object":
+            result["additionalProperties"] = False
+        for value in result.values():
+            _strict_json_schema(value)
+    elif isinstance(result, list):
+        for value in result:
+            _strict_json_schema(value)
+    return result
+
+
+EVALUATION_JSON_SCHEMA = _strict_json_schema(EVALUATION_FUNCTION["parameters"])
+
+
 def _extract_json(text):
     clean = str(text or "").strip()
     clean = re.sub(r"^```(?:json)?\s*", "", clean, flags=re.IGNORECASE)
@@ -596,6 +622,158 @@ async def _transcribe_recording(recording_id, track="user"):
     }
 
 
+def _openrouter_error(response, body):
+    error = body.get("error") if isinstance(body, dict) else None
+    if isinstance(error, dict):
+        message = error.get("message") or error.get("code")
+    else:
+        message = None
+    return RuntimeError(
+        f"OpenRouter QA hatası ({response.status}): "
+        f"{message or str(body)[:500]}"
+    )
+
+
+async def _call_openrouter_evaluator_once(payload, model, use_tools=False):
+    """QA raporunu OpenRouter Chat Completions REST API'den alır.
+
+    Öncelik strict JSON schema'dadır. Bir model bu özelliği desteklemiyorsa,
+    aynı şema zorunlu tool çağrısı olarak ikinci kez denenir.
+    """
+    if not OPENROUTER_API_KEY:
+        raise RuntimeError("OPENROUTER_API_KEY tanımlı değil.")
+
+    serialized_payload = json.dumps(payload, ensure_ascii=False)
+    messages = [
+        {"role": "system", "content": EVALUATOR_PROMPT},
+        {
+            "role": "user",
+            "content": (
+                "Yalnızca aşağıdaki JSON içindeki kaynakları kullanarak "
+                "değerlendirme yap. Çıktıyı istenen yapılandırılmış formatta "
+                "döndür; açıklama veya markdown ekleme.\n\n"
+                + serialized_payload
+            ),
+        },
+    ]
+    request_payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": 0,
+        "max_tokens": 6000,
+    }
+    if use_tools:
+        request_payload["tools"] = [{
+            "type": "function",
+            "function": {
+                "name": EVALUATION_FUNCTION["name"],
+                "description": EVALUATION_FUNCTION["description"],
+                "parameters": EVALUATION_JSON_SCHEMA,
+            },
+        }]
+        request_payload["tool_choice"] = {
+            "type": "function",
+            "function": {"name": EVALUATION_FUNCTION["name"]},
+        }
+    else:
+        request_payload["response_format"] = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": EVALUATION_FUNCTION["name"],
+                "strict": True,
+                "schema": EVALUATION_JSON_SCHEMA,
+            },
+        }
+
+    print(
+        "Voice QA OpenRouter isteği:",
+        f"model={model}",
+        f"mode={'tools' if use_tools else 'json_schema'}",
+        f"system_prompt_chars={len(EVALUATOR_PROMPT)}",
+        f"payload_chars={len(serialized_payload)}",
+    )
+    timeout = aiohttp.ClientTimeout(total=120)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(
+            OPENROUTER_URL,
+            headers={
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "https://cinematchsocial.web.app",
+                "X-Title": "CineMatch Voice QA",
+            },
+            json=request_payload,
+        ) as response:
+            body = await response.json(content_type=None)
+            if response.status >= 400:
+                raise _openrouter_error(response, body)
+
+    choices = body.get("choices") or []
+    if not choices:
+        raise RuntimeError("OpenRouter QA yanıtında choices bulunamadı.")
+    message = choices[0].get("message") or {}
+    tool_calls = message.get("tool_calls") or []
+    if tool_calls:
+        arguments = (tool_calls[0].get("function") or {}).get("arguments")
+        if isinstance(arguments, dict):
+            return arguments
+        if isinstance(arguments, str):
+            return json.loads(arguments)
+    content = message.get("content")
+    if isinstance(content, list):
+        content = "".join(
+            str(part.get("text") or "")
+            for part in content if isinstance(part, dict)
+        )
+    if not str(content or "").strip():
+        raise RuntimeError("OpenRouter QA boş çıktı döndürdü.")
+    return _extract_json(content)
+
+
+async def _call_openrouter_evaluator(payload, model, attempts=2):
+    errors = []
+    for attempt in range(1, attempts + 1):
+        try:
+            try:
+                return await _call_openrouter_evaluator_once(payload, model)
+            except (RuntimeError, ValueError) as exc:
+                # Bazı modeller json_schema'yı desteklemez; yalnızca bu
+                # durumda veya serbest/geçersiz JSON döndürdüğünde aynı strict
+                # şemayı zorunlu function call ile dene.
+                detail = str(exc).lower()
+                if any(marker in detail for marker in (
+                    "response_format", "json_schema", "structured",
+                    "unsupported", "not support", "400",
+                )) or isinstance(exc, ValueError):
+                    return await _call_openrouter_evaluator_once(
+                        payload, model, use_tools=True
+                    )
+                raise
+        except (aiohttp.ClientError, asyncio.TimeoutError, RuntimeError,
+                ValueError, json.JSONDecodeError) as exc:
+            errors.append(str(exc))
+            detail = str(exc).lower()
+            transient = (
+                isinstance(exc, (aiohttp.ClientError, asyncio.TimeoutError))
+                or any(marker in detail for marker in (
+                    "timeout", "timed out", "connection", "disconnect",
+                    "429", "500", "502", "503", "504",
+                ))
+            )
+            if not transient or attempt >= attempts:
+                break
+            delay = 2 ** (attempt - 1)
+            print(
+                "Voice QA OpenRouter geçici hata; yeniden denenecek:",
+                f"attempt={attempt}/{attempts}", f"delay={delay}s", repr(exc),
+            )
+            await asyncio.sleep(delay)
+    raise RuntimeError(
+        f"OpenRouter QA {attempts} denemede tamamlanamadı: "
+        + " | ".join(errors)
+    )
+
+
 async def _call_deepgram_evaluator_once(payload, provider_type, model):
     if not DEEPGRAM_API_KEY:
         raise RuntimeError("DEEPGRAM_API_KEY tanımlı değil.")
@@ -719,11 +897,12 @@ async def evaluate_voice_session(
     allow_session_fallback=True,
     idle_grace_seconds=15,
 ):
-    # Mini model geçerli JSON üretse bile kaynak dışı gerekçe üretmeye devam
-    # edebildiği için QA'da daha güçlü model birincil olmalı.
+    # QA değerlendirmesi artık Deepgram Agent WebSocket'i değil, OpenRouter
+    # Chat Completions REST API'sini kullanır. Deepgram yalnızca WAV -> STT
+    # adımında kalır; canlı Voice Agent akışı bundan etkilenmez.
     provider_chain = list(dict.fromkeys([
-        ("open_ai", "gpt-4o"),
-        ("open_ai", EVALUATION_MODEL),
+        ("openrouter", OPENROUTER_QA_MODEL),
+        ("openrouter", OPENROUTER_QA_FALLBACK_MODEL),
     ]))
     try:
         if wait_for_idle:
@@ -851,9 +1030,8 @@ async def evaluate_voice_session(
         used_model = None
         for provider_type, model in provider_chain:
             try:
-                raw_result = await _call_deepgram_evaluator(
+                raw_result = await _call_openrouter_evaluator(
                     evaluation_payload,
-                    provider_type,
                     model,
                 )
                 used_provider = provider_type
@@ -869,7 +1047,7 @@ async def evaluate_voice_session(
                 )
         if raw_result is None:
             raise RuntimeError( 
-                "Tüm Deepgram managed QA modelleri başarısız: "
+                "Tüm OpenRouter QA modelleri başarısız: "
                 + " | ".join(provider_errors)
             )
         comparison = raw_result.setdefault("transcript_comparison", {})
