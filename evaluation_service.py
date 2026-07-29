@@ -58,11 +58,10 @@ Veri uydurma. Belirgin konuşma tanıma hataları varsa bunları issue olarak
 raporla ve overall_score değerini gereksiz şekilde yüksek verme.
 
 İki transkript arasındaki yalnızca yazım, noktalama, ek, çekim veya aynı anlamı
-taşıyan eş anlamlı ifade farklarını speech_recognition_error sayma. Örneğin
-"iletişime geçmek" ve "iletişim kurmak" tek başına anlam kaybı değildir.
+taşıyan eş anlamlı ifade farklarını speech_recognition_error sayma.
 Hata ancak kullanıcının niyeti, varlık adı, sayı, olumsuzluk, tercih veya
 cevabın yönü değişiyorsa raporlanmalıdır. Kanıt alanında iki taraftaki gerçek
-ifadeyi aynen göster; transkriptte bulunmayan örnek uydurma.
+ifadeyi aynen göster; transkriptte bulunmayan ifade uydurma.
 logged_transcript içindeki "user" alanı canlı STT'nin kullanıcıdan anladığı
 metindir; "assistant" alanı agent cevabıdır. speech_recognition_error için
 assistant cevabını, agentın duyduğu kullanıcı metni gibi kullanma. Bu kriterde
@@ -161,14 +160,13 @@ Barge-in metriği varsa barge_in_handling kriterini bu ölçüme dayanarak puanl
 yoksa gözlenemedi olarak bırak.
 
 ZORUNLU KAYNAK KURALI: Bu QA için tek gerçek kaynak payload içindeki
-audio_transcript ve logged_transcript alanlarıdır. Dünya bilgini, varsayımını,
-örnek konuşmaları veya başka oturumları kullanma. Bir şehir, film, kişi, sayı,
-araç çağrısı ya da konu bu alanlarda açıkça geçmiyorsa rapora kesinlikle yazma.
-Örneğin dökümde hava durumu geçmiyorsa hava durumuna ilişkin hiçbir puan,
-issue, güçlü yön veya öneri üretme.
+audio_transcript, agent_audio_transcript ve logged_transcript alanlarıdır.
+Dünya bilgini, varsayımını, örnek konuşmaları veya başka oturumları kullanma.
+Bu alanlarda açıkça geçmeyen hiçbir konu, kişi, film, yer, sayı veya olay
+rapora yazılamaz.
 
 Her observed=true kriterinin reason alanı `Turn <numara>: "tam alıntı" —`
-ile başlamalıdır; alıntı logged_transcript'teki ilgili turdan harfiyen
+ile başlamalıdır; alıntı payload'daki gerçek kaynak metinden harfiyen
 alınmalıdır. Böyle bir alıntı yoksa observed=false ve score=null kullan.
 Her issue.evidence alanı da gerçek bir turn alıntısı olmalıdır. Önce turn'leri
 ve alıntıları içinden belirle, sonra yalnızca bunlara dayanarak raporla.
@@ -361,12 +359,24 @@ def _has_evidence_overlap(source_text, evidence):
     )
 
 
+def _reason_has_source_quote(source_text, reason):
+    """Kriter gerekçesindeki çift tırnaklı alıntıyı gerçek kaynakta ara."""
+    quotes = re.findall(r'["“]([^"”]+)["”]', str(reason or ""))
+    return any(
+        _contains_quoted_evidence(source_text, quote)
+        for quote in quotes
+    )
+
+
 def _validate_qa_evidence(result, audio_text, turns, agent_audio_text=""):
-    """LLM kanıtlarını doğrula; geçersiz tek bulgu tüm raporu bozmasın.
+    """LLM çıktısının tüm somut iddialarının gerçek kaynakta olduğunu doğrula.
 
     audio_text: kullanıcı WAV'ının bağımsız STT çıktısı.
     agent_audio_text: agent WAV'ının bağımsız STT çıktısı (mevcutsa).
     turns: logged_transcript (canlı sırada DB'ye yazılan user/assistant metni).
+
+    Bu fonksiyon raporu değiştirmez veya alan silmez. Kanıt bulunamadığında
+    hata yükseltir; çağıran kod aynı modele düzeltme isteğiyle tekrar gider.
     """
     if not isinstance(result, dict):
         raise ValueError("QA sonucu nesne değil.")
@@ -382,45 +392,35 @@ def _validate_qa_evidence(result, audio_text, turns, agent_audio_text=""):
     logged_all = " ".join([logged_users, logged_assistants])
     all_transcript = " ".join([independent_audio, logged_all])
     comparison = result.get("transcript_comparison") or {}
-    valid_mismatches = []
     for mismatch in comparison.get("mismatches") or []:
         if not isinstance(mismatch, dict):
-            print("Voice QA geçersiz uyuşmazlık atlandı: nesne değil.")
-            continue
+            raise ValueError("QA uyuşmazlık kanıtı nesne değil.")
         audio_says = mismatch.get("audio_says")
         agent_understood = mismatch.get("agent_understood")
         if not (
             _contains_quoted_evidence(independent_audio, audio_says)
             and _contains_quoted_evidence(logged_all, agent_understood)
         ):
-            print(
-                "Voice QA kanıtsız STT uyuşmazlığı atlandı:",
-                f"audio={audio_says!r}, logged={agent_understood!r}",
+            raise ValueError(
+                "QA transkriptte bulunmayan STT uyuşmazlığı üretti: "
+                f"audio={audio_says!r}, logged={agent_understood!r}"
             )
-            continue
-        valid_mismatches.append(mismatch)
-    comparison["mismatches"] = valid_mismatches
-    result["transcript_comparison"] = comparison
-
-    valid_issues = []
     for issue in result.get("issues") or []:
         if not isinstance(issue, dict):
-            print("Voice QA geçersiz issue atlandı: nesne değil.")
-            continue
+            raise ValueError("QA issue kaydı nesne değil.")
         if not _has_evidence_overlap(all_transcript, issue.get("evidence")):
-            print(
-                "Voice QA kanıtsız issue atlandı:",
-                f"{issue.get('evidence')!r}",
+            raise ValueError(
+                "QA issue kanıtı konuşma dökümünde bulunamadı: "
+                f"{issue.get('evidence')!r}"
             )
+    for criterion, item in (result.get("criteria") or {}).items():
+        if not isinstance(item, dict) or item.get("observed") is not True:
             continue
-        if (
-            issue.get("type") == "speech_recognition_error"
-            and not valid_mismatches
-        ):
-            print("Voice QA kanıtsız STT issue atlandı.")
-            continue
-        valid_issues.append(issue)
-    result["issues"] = valid_issues
+        if not _reason_has_source_quote(all_transcript, item.get("reason")):
+            raise ValueError(
+                "QA kriter gerekçesinde kaynakta olmayan veya eksik alıntı var: "
+                f"criterion={criterion!r}, reason={item.get('reason')!r}"
+            )
     return result
 
 
@@ -803,15 +803,45 @@ async def evaluate_voice_session(
         used_model = None
         for provider_type, model in provider_chain:
             try:
-                candidate_result = await _call_deepgram_evaluator(
-                    evaluation_payload,
-                    provider_type,
-                    model,
-                )
-                raw_result = candidate_result
-                used_provider = provider_type
-                used_model = model
-                break
+                evaluator_payload = evaluation_payload
+                for output_attempt in range(1, 3):
+                    candidate_result = await _call_deepgram_evaluator(
+                        evaluator_payload,
+                        provider_type,
+                        model,
+                    )
+                    try:
+                        _validate_qa_evidence(
+                            candidate_result,
+                            audio_transcript,
+                            turns,
+                            agent_audio_text=agent_audio_transcript,
+                        )
+                    except ValueError as evidence_error:
+                        if output_attempt >= 2:
+                            raise
+                        print(
+                            "Voice QA kanıt doğrulaması başarısız; "
+                            "model düzeltme için yeniden çağrılacak:",
+                            str(evidence_error),
+                        )
+                        evaluator_payload = dict(evaluation_payload)
+                        evaluator_payload["qa_validation_feedback"] = (
+                            "Önceki taslakta kaynakta bulunmayan veya çift "
+                            "tırnak içinde gerçek bir alıntı içermeyen "
+                            f"kanıt vardı: {evidence_error}. Raporu yalnızca "
+                            "payload kaynaklarından gerçek alıntılarla "
+                            "baştan üret. Kanıtı olmayan kriteri "
+                            "observed=false ve score=null olarak bildir; "
+                            "kaynakta olmayan ifadeyi kullanma."
+                        )
+                        continue
+                    raw_result = candidate_result
+                    used_provider = provider_type
+                    used_model = model
+                    break
+                if raw_result is not None:
+                    break
             except Exception as provider_error:
                 provider_errors.append(
                     f"{provider_type}/{model}: {provider_error}"
@@ -836,14 +866,6 @@ async def evaluate_voice_session(
                     or issue.get("type") != "speech_recognition_error"
                 )
             ]
-        # Kanıtsız (transkriptte geçmeyen) uyuşmazlık/issue'ları filtrele.
-        # Bu adım daha önce tanımlıydı ama hiç çağrılmıyordu.
-        raw_result = _validate_qa_evidence(
-            raw_result,
-            audio_transcript,
-            turns,
-            agent_audio_text=agent_audio_transcript,
-        )
         result = _validate_result(raw_result)
         result["evaluator_provider"] = used_provider
         result["evaluator_model"] = used_model
