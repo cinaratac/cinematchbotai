@@ -290,7 +290,12 @@ def re_evaluate_voice_recording(recording_id):
         recording["session_id"], recording_id, model_chain
     )
     try:
-        schedule_voice_evaluation(recording["session_id"], recording_id)
+        schedule_voice_evaluation(
+            recording["session_id"],
+            recording_id,
+            wait_for_idle=False,
+            allow_session_fallback=False,
+        )
     except Exception as exc:
         db.fail_voice_ai_evaluation(recording_id, exc)
         return jsonify({

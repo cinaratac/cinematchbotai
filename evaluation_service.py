@@ -610,17 +610,25 @@ async def _call_deepgram_evaluator(payload, provider_type, model, attempts=3):
     )
 
 
-async def evaluate_voice_session(session_id, recording_id):
+async def evaluate_voice_session(
+    session_id,
+    recording_id,
+    wait_for_idle=True,
+    allow_session_fallback=True,
+):
     provider_chain = list(dict.fromkeys([
         ("open_ai", EVALUATION_MODEL),
         ("open_ai", "gpt-4o"),
     ]))
     try:
-        print(
-            "Voice AI değerlendirmesi canlı görüşmelerin bitmesini bekliyor:",
-            recording_id,
-        )
-        await wait_for_voice_idle(grace_seconds=15)
+        if wait_for_idle:
+            print(
+                "Voice AI değerlendirmesi canlı görüşmelerin bitmesini bekliyor:",
+                recording_id,
+            )
+            await wait_for_voice_idle(grace_seconds=15)
+        else:
+            print("Voice AI admin yeniden değerlendirmesi başlıyor:", recording_id)
         await asyncio.to_thread(
             start_voice_ai_evaluation,
             session_id,
@@ -632,9 +640,10 @@ async def evaluate_voice_session(session_id, recording_id):
         transcript = await asyncio.to_thread(
             get_recording_transcript, recording_id, 100
         )
-        # Eski kayıtlar recording_id alanı eklenmeden oluşturulmuş olabilir.
-        # Onlar için geriye dönük olarak oturumun son turlarını kullan.
-        if not transcript:
+        # Otomatik QA eski kayıt uyumluluğu için oturum fallback'i kullanır.
+        # Admin tekrar değerlendirmesinde bu fallback seçili WAV ile ilgisiz
+        # son konuşma turlarını eşleştirebildiği için bilinçli olarak kapatılır.
+        if not transcript and allow_session_fallback:
             transcript = await asyncio.to_thread(
                 get_session_transcript, session_id, 20
             )
@@ -761,11 +770,21 @@ def set_voice_evaluation_loop(loop):
     VOICE_EVALUATION_LOOP = loop
 
 
-def _create_voice_evaluation_task(session_id, recording_id):
+def _create_voice_evaluation_task(
+    session_id,
+    recording_id,
+    wait_for_idle=True,
+    allow_session_fallback=True,
+):
     """Bu fonksiyon mutlaka çalışan bir asyncio loop'u içinde çağrılmalıdır."""
     print("Voice AI değerlendirmesi arka plana alındı:", recording_id)
     task = asyncio.create_task(
-        evaluate_voice_session(session_id, recording_id),
+        evaluate_voice_session(
+            session_id,
+            recording_id,
+            wait_for_idle,
+            allow_session_fallback,
+        ),
         name=f"voice-evaluation-{recording_id}",
     )
     EVALUATION_TASKS.add(task)
@@ -783,7 +802,12 @@ def _create_voice_evaluation_task(session_id, recording_id):
     return task
 
 
-def schedule_voice_evaluation(session_id, recording_id):
+def schedule_voice_evaluation(
+    session_id,
+    recording_id,
+    wait_for_idle=True,
+    allow_session_fallback=True,
+):
     """QA işini aktif loop'ta veya WSGI'den ana aiohttp loop'unda başlatır."""
     try:
         asyncio.get_running_loop()
@@ -794,10 +818,30 @@ def schedule_voice_evaluation(session_id, recording_id):
                 "Voice QA scheduler henüz hazır değil; sunucu başlatılıyor olabilir."
             )
         return asyncio.run_coroutine_threadsafe(
-            _schedule_voice_evaluation_on_loop(session_id, recording_id), loop
+            _schedule_voice_evaluation_on_loop(
+                session_id,
+                recording_id,
+                wait_for_idle,
+                allow_session_fallback,
+            ), loop
         )
-    return _create_voice_evaluation_task(session_id, recording_id)
+    return _create_voice_evaluation_task(
+        session_id,
+        recording_id,
+        wait_for_idle,
+        allow_session_fallback,
+    )
 
 
-async def _schedule_voice_evaluation_on_loop(session_id, recording_id):
-    return _create_voice_evaluation_task(session_id, recording_id)
+async def _schedule_voice_evaluation_on_loop(
+    session_id,
+    recording_id,
+    wait_for_idle,
+    allow_session_fallback,
+):
+    return _create_voice_evaluation_task(
+        session_id,
+        recording_id,
+        wait_for_idle,
+        allow_session_fallback,
+    )
