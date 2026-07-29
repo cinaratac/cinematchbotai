@@ -23,25 +23,14 @@ from voice.activity import wait_for_voice_idle
 
 
 DEEPGRAM_API_KEY = os.environ.get("DEEPGRAM_API_KEY", "")
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 EVALUATION_MODEL = os.environ.get(
-    # QA'nın testte ücretli kredi gerektirmeden çalışabilmesi için ücretsiz,
-    # Structured Outputs destekli varyant. Production kalite/kapasite gerektiğinde
-    # Render'da VOICE_EVALUATION_MODEL ile ücretli modele geçilebilir.
-    "VOICE_EVALUATION_MODEL", "google/gemma-4-26b-a4b-it:free"
+    "VOICE_EVALUATION_MODEL", "gpt-4o-mini"
 )
-# Eski Deepgram ayarlarında model adı `gpt-4o-mini` olarak tutuluyordu.
-# OpenRouter model kimliğinde sağlayıcı öneki gerekir; geriye dönük uyumluluk
-# için eski OpenAI model adlarını otomatik dönüştürüyoruz.
-if "/" not in EVALUATION_MODEL:
-    EVALUATION_MODEL = f"openai/{EVALUATION_MODEL}"
+if not EVALUATION_MODEL.startswith("gpt-"):
+    EVALUATION_MODEL = "gpt-4o-mini"
 EVALUATION_TASKS = set()
 VOICE_EVALUATION_LOOP = None
-# QA canlı voice yolunun dışında çalışır; birden fazla eski kaydı aynı anda
-# yeniden değerlendirmek ücretsiz/limitli LLM sağlayıcılarında timeout üretir.
-# Tek işçi, Firestore'daki `queued` durumunu gerçek bir iş kuyruğu gibi yapar.
-EVALUATION_SEMAPHORE = asyncio.Semaphore(1)
-QA_EVALUATOR_VERSION = "openrouter-chat-json-schema-v1"
+QA_EVALUATOR_VERSION = "deepgram-agent-websocket-v1"
 STT_REFERENCE_VERSION = "deepgram-nova-3-tr"
 TRANSCRIPT_METRIC_VERSION = "wer-token-v1"
 
@@ -591,69 +580,79 @@ async def _transcribe_recording(recording_id):
     }
 
 
-def _openrouter_output_json(response):
-    """OpenRouter Chat Completions Structured Output JSON'unu al."""
-    choices = response.get("choices") or []
-    message = choices[0].get("message") if choices else None
-    content = message.get("content") if isinstance(message, dict) else None
-    if not isinstance(content, str) or not content.strip():
-        raise RuntimeError("OpenRouter QA isteği Structured Output döndürmedi.")
-    return json.loads(content)
-
-
-async def _call_openrouter_evaluator_once(payload, model):
-    if not OPENROUTER_API_KEY:
-        raise RuntimeError("OPENROUTER_API_KEY tanımlı değil.")
+async def _call_deepgram_evaluator_once(payload, provider_type, model):
+    if not DEEPGRAM_API_KEY:
+        raise RuntimeError("DEEPGRAM_API_KEY tanımlı değil.")
     serialized_payload = json.dumps(payload, ensure_ascii=False)
-    request_body = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": EVALUATOR_PROMPT},
-            {"role": "user", "content": serialized_payload},
-        ],
-        "temperature": 0.1,
-        "response_format": {
-            "type": "json_schema",
-            "json_schema": {
-                "name": "voice_qa_evaluation",
-                "strict": True,
-                "schema": EVALUATION_JSON_SCHEMA,
-            },
+    settings = {
+        "type": "Settings",
+        "tags": ["cinematch", "qa-evaluator"],
+        "audio": {
+            "input": {"encoding": "linear16", "sample_rate": 16000},
+            "output": {"encoding": "linear16", "sample_rate": 24000, "container": "none"},
         },
-        # Schema desteği olmayan bir sağlayıcıya sessizce düşmek yerine hata
-        # verip fallback modele geçeriz.
-        "provider": {"require_parameters": True},
+        "agent": {
+            "language": "tr",
+            "listen": {"provider": {"type": "deepgram", "model": "nova-3", "language": "tr"}},
+            "think": {
+                "provider": {"type": provider_type, "model": model, "temperature": 0.1},
+                "prompt": EVALUATOR_PROMPT,
+                "functions": [EVALUATION_FUNCTION],
+            },
+            "speak": {"provider": {
+                "type": "cartesia", "model_id": "sonic-3",
+                "voice": {"mode": "id", "id": "a167e0f3-df7e-4d52-a9c3-f949145efdab"},
+                "language": "tr", "speed": "normal",
+            }},
+        },
     }
     print(
-        "Voice QA OpenRouter isteği:",
+        "Voice QA Deepgram isteği:",
+        f"provider={provider_type}",
         f"model={model}",
         f"prompt_version={QA_PROMPT_VERSION}",
         f"payload_chars={len(serialized_payload)}",
     )
     timeout = aiohttp.ClientTimeout(total=90)
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json=request_body,
-        ) as response:
-            body = await response.json(content_type=None)
-            if response.status >= 400:
-                raise RuntimeError(
-                    f"OpenRouter QA hatası ({response.status}): {body}"
-                )
-    return _openrouter_output_json(body)
+        async with session.ws_connect(
+            "wss://agent.deepgram.com/v1/agent/converse",
+            headers={"Authorization": f"Token {DEEPGRAM_API_KEY}"},
+            heartbeat=20,
+        ) as ws:
+            async for message in ws:
+                if message.type != aiohttp.WSMsgType.TEXT:
+                    continue
+                event = json.loads(message.data)
+                event_type = event.get("type")
+                if event_type == "Welcome":
+                    await ws.send_json(settings)
+                elif event_type == "SettingsApplied":
+                    await ws.send_json({"type": "InjectUserMessage", "content": serialized_payload})
+                elif event_type == "FunctionCallRequest":
+                    for function_call in event.get("functions") or []:
+                        if function_call.get("name") != "submit_evaluation":
+                            continue
+                        arguments = function_call.get("arguments")
+                        if isinstance(arguments, dict):
+                            return arguments
+                        if isinstance(arguments, str):
+                            return json.loads(arguments)
+                    raise RuntimeError("QA agentı beklenmeyen bir function çağırdı.")
+                elif event_type == "ConversationText" and event.get("role") == "assistant":
+                    return _extract_json(event.get("content"))
+                elif event_type == "Error":
+                    detail = event.get("description") or event.get("message") or "Deepgram evaluator hatası."
+                    raise RuntimeError(detail)
+    raise RuntimeError("Değerlendirme agentından cevap alınamadı.")
 
 
-async def _call_openrouter_evaluator(payload, model, attempts=3):
-    """Geçici REST/provider hatalarında üstel geri çekilmeli yeniden deneme."""
+async def _call_deepgram_evaluator(payload, provider_type, model, attempts=3):
+    """Geçici WS/provider hatalarında üstel geri çekilmeli yeniden deneme."""
     errors = []
     for attempt in range(1, attempts + 1):
         try:
-            return await _call_openrouter_evaluator_once(payload, model)
+            return await _call_deepgram_evaluator_once(payload, provider_type, model)
         except (aiohttp.ClientError, asyncio.TimeoutError, RuntimeError) as exc:
             errors.append(str(exc))
             detail = str(exc).lower()
@@ -689,14 +688,10 @@ async def _call_openrouter_evaluator(payload, model, attempts=3):
 
 
 async def evaluate_voice_session(session_id, recording_id):
-    # Ücretsiz varsayılanda ücretli fallback denemek yalnızca ikinci bir 402
-    # üretir. Ücretli bir model açıkça yapılandırılırsa ücretsiz Gemma geri
-    # dönüşüyle QA yine test edilebilir kalır.
-    model_chain = list(dict.fromkeys([
-        EVALUATION_MODEL,
-        "google/gemma-4-26b-a4b-it:free",
+    provider_chain = list(dict.fromkeys([
+        ("open_ai", EVALUATION_MODEL),
+        ("open_ai", "gpt-4o"),
     ]))
-    await EVALUATION_SEMAPHORE.acquire()
     try:
         print(
             "Voice AI değerlendirmesi canlı görüşmelerin bitmesini bekliyor:",
@@ -707,7 +702,9 @@ async def evaluate_voice_session(session_id, recording_id):
             start_voice_ai_evaluation,
             session_id,
             recording_id,
-            " -> ".join(f"openrouter/{model}" for model in model_chain),
+            " -> ".join(
+                f"{provider}/{model}" for provider, model in provider_chain
+            ),
         )
         transcript = await asyncio.to_thread(
             get_recording_transcript, recording_id, 100
@@ -782,10 +779,10 @@ async def evaluate_voice_session(session_id, recording_id):
         raw_result = None
         used_provider = None
         used_model = None
-        for model in model_chain:
+        for provider_type, model in provider_chain:
             try:
-                candidate_result = await _call_openrouter_evaluator(
-                    evaluation_payload, model
+                candidate_result = await _call_deepgram_evaluator(
+                    evaluation_payload, provider_type, model
                 )
                 _validate_qa_evidence(
                     candidate_result,
@@ -793,12 +790,12 @@ async def evaluate_voice_session(session_id, recording_id):
                     turns,
                 )
                 raw_result = candidate_result
-                used_provider = "openrouter"
+                used_provider = provider_type
                 used_model = model
                 break
             except Exception as provider_error:
                 provider_errors.append(
-                    f"openrouter/{model}: {provider_error}"
+                    f"{provider_type}/{model}: {provider_error}"
                 )
                 print(
                     "Voice QA model denemesi başarısız:",
@@ -806,7 +803,7 @@ async def evaluate_voice_session(session_id, recording_id):
                 )
         if raw_result is None:
             raise RuntimeError(
-                "Tüm OpenRouter QA modelleri başarısız: "
+                "Tüm Deepgram managed QA modelleri başarısız: "
                 + " | ".join(provider_errors)
             )
         comparison = raw_result.setdefault("transcript_comparison", {})
@@ -842,10 +839,6 @@ async def evaluate_voice_session(session_id, recording_id):
             )
         except Exception as persist_exc:
             print("Değerlendirme hata kaydı yazılamadı:", repr(persist_exc))
-    finally:
-        EVALUATION_SEMAPHORE.release()
-
-
 def set_voice_evaluation_loop(loop):
     """WSGI admin isteklerinin QA işini ana aiohttp loop'una iletmesini sağlar."""
     global VOICE_EVALUATION_LOOP
