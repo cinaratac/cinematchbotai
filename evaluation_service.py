@@ -673,7 +673,7 @@ async def _call_openrouter_evaluator_once(payload, model, use_tools=False):
         # OpenRouter hesabındaki mevcut kredi sınırının altında kalır;
         # transkript/prompt kısaltılmaz, yalnızca modelin JSON çıktısı
         # için ayrılan üst sınır kontrol edilir.
-        "max_tokens": 4500,
+        "max_tokens": 4000,
     }
     if use_tools:
         request_payload["tools"] = [{
@@ -770,8 +770,11 @@ async def _call_openrouter_evaluator(payload, model, attempts=2):
                 isinstance(exc, (aiohttp.ClientError, asyncio.TimeoutError))
                 or any(marker in detail for marker in (
                     "timeout", "timed out", "connection", "disconnect",
-                    "429", "500", "502", "503", "504",
                 ))
+                # HTTP kodlarını substring olarak arama: "4500" içindeki
+                # "500" ifadesi kredi hatasını yanlışlıkla geçici hata gibi
+                # gösterip gereksiz retry başlatıyordu.
+                or bool(re.search(r"\b(?:429|500|502|503|504)\b", detail))
             )
             if not transient or attempt >= attempts:
                 break
