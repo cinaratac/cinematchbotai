@@ -37,6 +37,10 @@ if "/" not in EVALUATION_MODEL:
     EVALUATION_MODEL = f"openai/{EVALUATION_MODEL}"
 EVALUATION_TASKS = set()
 VOICE_EVALUATION_LOOP = None
+# QA canlı voice yolunun dışında çalışır; birden fazla eski kaydı aynı anda
+# yeniden değerlendirmek ücretsiz/limitli LLM sağlayıcılarında timeout üretir.
+# Tek işçi, Firestore'daki `queued` durumunu gerçek bir iş kuyruğu gibi yapar.
+EVALUATION_SEMAPHORE = asyncio.Semaphore(1)
 QA_EVALUATOR_VERSION = "openrouter-chat-json-schema-v1"
 STT_REFERENCE_VERSION = "deepgram-nova-3-tr"
 TRANSCRIPT_METRIC_VERSION = "wer-token-v1"
@@ -692,6 +696,7 @@ async def evaluate_voice_session(session_id, recording_id):
         EVALUATION_MODEL,
         "google/gemma-4-26b-a4b-it:free",
     ]))
+    await EVALUATION_SEMAPHORE.acquire()
     try:
         print(
             "Voice AI değerlendirmesi canlı görüşmelerin bitmesini bekliyor:",
@@ -837,6 +842,8 @@ async def evaluate_voice_session(session_id, recording_id):
             )
         except Exception as persist_exc:
             print("Değerlendirme hata kaydı yazılamadı:", repr(persist_exc))
+    finally:
+        EVALUATION_SEMAPHORE.release()
 
 
 def set_voice_evaluation_loop(loop):
