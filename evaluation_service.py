@@ -334,7 +334,7 @@ def _has_evidence_overlap(source_text, evidence):
 
 
 def _validate_qa_evidence(result, audio_text, turns):
-    """LLM'nin transkriptte bulunmayan kanıtlarla rapor üretmesini reddet."""
+    """LLM kanıtlarını doğrula; geçersiz tek bulgu tüm raporu bozmasın."""
     if not isinstance(result, dict):
         raise ValueError("QA sonucu nesne değil.")
     logged_users = " ".join(
@@ -349,37 +349,45 @@ def _validate_qa_evidence(result, audio_text, turns):
         ),
     ])
     comparison = result.get("transcript_comparison") or {}
-    mismatches = comparison.get("mismatches") or []
-    valid_mismatch_count = 0
-    for mismatch in mismatches:
+    valid_mismatches = []
+    for mismatch in comparison.get("mismatches") or []:
         if not isinstance(mismatch, dict):
-            raise ValueError("QA uyuşmazlık kanıtı nesne değil.")
+            print("Voice QA geçersiz uyuşmazlık atlandı: nesne değil.")
+            continue
         audio_says = mismatch.get("audio_says")
         agent_understood = mismatch.get("agent_understood")
         if not (
             _contains_quoted_evidence(audio_text, audio_says)
             and _contains_quoted_evidence(logged_users, agent_understood)
         ):
-            raise ValueError(
-                "QA transkriptte bulunmayan STT uyuşmazlığı üretti: "
-                f"audio={audio_says!r}, logged={agent_understood!r}"
+            print(
+                "Voice QA kanıtsız STT uyuşmazlığı atlandı:",
+                f"audio={audio_says!r}, logged={agent_understood!r}",
             )
-        valid_mismatch_count += 1
+            continue
+        valid_mismatches.append(mismatch)
+    comparison["mismatches"] = valid_mismatches
+    result["transcript_comparison"] = comparison
+
+    valid_issues = []
     for issue in result.get("issues") or []:
         if not isinstance(issue, dict):
-            raise ValueError("QA issue kaydı nesne değil.")
+            print("Voice QA geçersiz issue atlandı: nesne değil.")
+            continue
         if not _has_evidence_overlap(all_transcript, issue.get("evidence")):
-            raise ValueError(
-                "QA issue kanıtı konuşma dökümünde bulunamadı: "
-                f"{issue.get('evidence')!r}"
+            print(
+                "Voice QA kanıtsız issue atlandı:",
+                f"{issue.get('evidence')!r}",
             )
+            continue
         if (
             issue.get("type") == "speech_recognition_error"
-            and valid_mismatch_count == 0
+            and not valid_mismatches
         ):
-            raise ValueError(
-                "QA doğrulanmış uyuşmazlık olmadan STT hatası üretti."
-            )
+            print("Voice QA kanıtsız STT issue atlandı.")
+            continue
+        valid_issues.append(issue)
+    result["issues"] = valid_issues
     return result
 
 
@@ -716,11 +724,6 @@ async def evaluate_voice_session(
                     evaluation_payload,
                     provider_type,
                     model,
-                )
-                _validate_qa_evidence(
-                    candidate_result,
-                    audio_transcript,
-                    turns,
                 )
                 raw_result = candidate_result
                 used_provider = provider_type
