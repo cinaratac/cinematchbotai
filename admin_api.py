@@ -285,7 +285,7 @@ def re_evaluate_voice_recording(recording_id):
             "message": "Bu kayıt için zaten çalışan bir değerlendirme var.",
         }), 409
 
-    model_chain = f"open_ai/{EVALUATION_MODEL} -> open_ai/gpt-4o"
+    model_chain = f"openrouter/{EVALUATION_MODEL}"
     db.queue_voice_ai_evaluation(
         recording["session_id"], recording_id, model_chain
     )

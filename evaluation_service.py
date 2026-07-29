@@ -25,9 +25,10 @@ from voice.activity import wait_for_voice_idle
 DEEPGRAM_API_KEY = os.environ.get("DEEPGRAM_API_KEY", "")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-OPENROUTER_QA_MODEL = os.environ.get(
-    "VOICE_QA_OPENROUTER_MODEL", "openai/gpt-4o-mini"
-)
+# QA için tek ve sabit model. Admin API eski import adını kullandığı için
+# EVALUATION_MODEL aynı değerin geriye dönük uyumluluk alias'ıdır.
+EVALUATION_MODEL = "openai/gpt-4.1"
+OPENROUTER_QA_MODEL = EVALUATION_MODEL
 EVALUATION_TASKS = set()
 VOICE_EVALUATION_LOOP = None
 
