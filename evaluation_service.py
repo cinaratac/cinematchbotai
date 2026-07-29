@@ -361,6 +361,12 @@ def _contains_quoted_evidence(source_text, claimed_text):
 
 
 def _has_evidence_overlap(source_text, evidence):
+    quoted = re.findall(r'["“]([^"”]+)["”]', str(evidence or ""))
+    if quoted:
+        return any(
+            _contains_quoted_evidence(source_text, quote)
+            for quote in quoted
+        )
     source_words = _normalize_transcript(source_text).split()
     evidence_words = _normalize_transcript(evidence).split()
     if len(evidence_words) < 2:
@@ -713,9 +719,11 @@ async def evaluate_voice_session(
     allow_session_fallback=True,
     idle_grace_seconds=15,
 ):
+    # Mini model geçerli JSON üretse bile kaynak dışı gerekçe üretmeye devam
+    # edebildiği için QA'da daha güçlü model birincil olmalı.
     provider_chain = list(dict.fromkeys([
-        ("open_ai", EVALUATION_MODEL),
         ("open_ai", "gpt-4o"),
+        ("open_ai", EVALUATION_MODEL),
     ]))
     try:
         if wait_for_idle:
