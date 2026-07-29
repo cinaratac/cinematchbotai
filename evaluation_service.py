@@ -13,7 +13,6 @@ from database import (
     fail_voice_ai_evaluation,
     get_performance_metrics_averages,
     get_recording_transcript,
-    get_session_transcript,
     skip_voice_ai_evaluation,
     start_voice_ai_evaluation,
 )
@@ -571,7 +570,6 @@ async def evaluate_voice_session(
     session_id,
     recording_id,
     wait_for_idle=True,
-    allow_session_fallback=True,
     idle_grace_seconds=15,
 ):
     provider_chain = list(dict.fromkeys([
@@ -598,24 +596,24 @@ async def evaluate_voice_session(
         transcript = await asyncio.to_thread(
             get_recording_transcript, recording_id, 100
         )
-        # Otomatik QA eski kayıt uyumluluğu için oturum fallback'i kullanır.
-        # Admin tekrar değerlendirmesinde bu fallback seçili WAV ile ilgisiz
-        # son konuşma turlarını eşleştirebildiği için bilinçli olarak kapatılır.
-        if not transcript and allow_session_fallback:
-            transcript = await asyncio.to_thread(
-                get_session_transcript, session_id, 20
-            )
         if not transcript:
             await asyncio.to_thread(
                 skip_voice_ai_evaluation,
                 recording_id,
-                "Görüşmede değerlendirilecek transkript oluşmadı.",
+                "Bu ses kaydına bağlı konuşma turu bulunamadı; başka "
+                "oturum verisiyle değerlendirme yapılmadı.",
             )
             print(
-                "Voice AI değerlendirmesi atlandı; transkript yok:",
+                "Voice AI değerlendirmesi atlandı; kayıtla bağlı transkript yok:",
                 recording_id,
             )
             return
+        print(
+            "Voice QA giriş verisi doğrulandı:",
+            f"recording_id={recording_id}",
+            f"linked_turns={len(transcript)}",
+            "source=recording_id",
+        )
         audio_result, agent_audio_result = await asyncio.gather(
             _transcribe_recording(recording_id, "user"),
             _transcribe_recording(recording_id, "agent"),
@@ -746,6 +744,8 @@ async def evaluate_voice_session(
         result["deterministic_agent_match_score"] = (
             deterministic_agent_match_score
         )
+        result["qa_input_source"] = "recording_id"
+        result["qa_input_turn_count"] = len(turns)
         await asyncio.to_thread(
             complete_voice_ai_evaluation, recording_id, result
         )
@@ -768,7 +768,6 @@ def _create_voice_evaluation_task(
     session_id,
     recording_id,
     wait_for_idle=True,
-    allow_session_fallback=True,
     idle_grace_seconds=15,
 ):
     """Bu fonksiyon mutlaka çalışan bir asyncio loop'u içinde çağrılmalıdır."""
@@ -778,7 +777,6 @@ def _create_voice_evaluation_task(
             session_id,
             recording_id,
             wait_for_idle,
-            allow_session_fallback,
             idle_grace_seconds,
         ),
         name=f"voice-evaluation-{recording_id}",
@@ -802,7 +800,6 @@ def schedule_voice_evaluation(
     session_id,
     recording_id,
     wait_for_idle=True,
-    allow_session_fallback=True,
     idle_grace_seconds=15,
 ):
     """QA işini aktif loop'ta veya WSGI'den ana aiohttp loop'unda başlatır."""
@@ -819,7 +816,6 @@ def schedule_voice_evaluation(
                 session_id,
                 recording_id,
                 wait_for_idle,
-                allow_session_fallback,
                 idle_grace_seconds,
             ), loop
         )
@@ -827,7 +823,6 @@ def schedule_voice_evaluation(
         session_id,
         recording_id,
         wait_for_idle,
-        allow_session_fallback,
         idle_grace_seconds,
     )
 
@@ -836,13 +831,11 @@ async def _schedule_voice_evaluation_on_loop(
     session_id,
     recording_id,
     wait_for_idle,
-    allow_session_fallback,
     idle_grace_seconds,
 ):
     return _create_voice_evaluation_task(
         session_id,
         recording_id,
         wait_for_idle,
-        allow_session_fallback,
         idle_grace_seconds,
     )
