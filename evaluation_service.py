@@ -585,6 +585,12 @@ async def _call_deepgram_evaluator_once(payload, provider_type, model, wav_bytes
                     # olur. Kayıt, gerçek QA verisi olan payload'dan bağımsız
                     # olarak yalnızca Agent oturumunu doğru başlatır.
                     chunk_size = input_sample_rate * 2 // 4
+                    print(
+                        "Voice QA Deepgram PCM akışı gönderiliyor:",
+                        f"bytes={len(pcm_bytes)}",
+                        f"sample_rate={input_sample_rate}",
+                        f"chunks={(len(pcm_bytes) + chunk_size - 1) // chunk_size}",
+                    )
                     for offset in range(0, len(pcm_bytes), chunk_size):
                         await ws.send_bytes(pcm_bytes[offset:offset + chunk_size])
                     await ws.send_json({"type": "InjectUserMessage", "content": serialized_payload})
@@ -774,7 +780,7 @@ async def evaluate_voice_session(
                     provider_errors[-1],
                 )
         if raw_result is None:
-            raise RuntimeError(
+            raise RuntimeError( 
                 "Tüm Deepgram managed QA modelleri başarısız: "
                 + " | ".join(provider_errors)
             )
