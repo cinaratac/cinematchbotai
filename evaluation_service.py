@@ -25,8 +25,10 @@ from voice.activity import wait_for_voice_idle
 DEEPGRAM_API_KEY = os.environ.get("DEEPGRAM_API_KEY", "")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 EVALUATION_MODEL = os.environ.get(
-    # Ana agentın kullandığı, Structured Outputs destekli OpenRouter modeli.
-    "VOICE_EVALUATION_MODEL", "google/gemma-4-26b-a4b-it"
+    # QA'nın testte ücretli kredi gerektirmeden çalışabilmesi için ücretsiz,
+    # Structured Outputs destekli varyant. Production kalite/kapasite gerektiğinde
+    # Render'da VOICE_EVALUATION_MODEL ile ücretli modele geçilebilir.
+    "VOICE_EVALUATION_MODEL", "google/gemma-4-26b-a4b-it:free"
 )
 # Eski Deepgram ayarlarında model adı `gpt-4o-mini` olarak tutuluyordu.
 # OpenRouter model kimliğinde sağlayıcı öneki gerekir; geriye dönük uyumluluk
@@ -683,9 +685,12 @@ async def _call_openrouter_evaluator(payload, model, attempts=3):
 
 
 async def evaluate_voice_session(session_id, recording_id):
+    # Ücretsiz varsayılanda ücretli fallback denemek yalnızca ikinci bir 402
+    # üretir. Ücretli bir model açıkça yapılandırılırsa ücretsiz Gemma geri
+    # dönüşüyle QA yine test edilebilir kalır.
     model_chain = list(dict.fromkeys([
         EVALUATION_MODEL,
-        "openai/gpt-4o-mini",
+        "google/gemma-4-26b-a4b-it:free",
     ]))
     try:
         print(

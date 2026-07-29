@@ -286,7 +286,8 @@ def re_evaluate_voice_recording(recording_id):
         }), 409
 
     model_chain = (
-        f"openrouter/{EVALUATION_MODEL} -> openrouter/openai/gpt-4o-mini"
+        f"openrouter/{EVALUATION_MODEL} "
+        "-> openrouter/google/gemma-4-26b-a4b-it:free"
     )
     db.queue_voice_ai_evaluation(
         recording["session_id"], recording_id, model_chain
