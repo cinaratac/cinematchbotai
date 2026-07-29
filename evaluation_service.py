@@ -572,6 +572,7 @@ async def _call_deepgram_evaluator_once(payload, provider_type, model, wav_bytes
             headers={"Authorization": f"Token {DEEPGRAM_API_KEY}"},
             heartbeat=20,
         ) as ws:
+            assistant_text_parts = []
             async for message in ws:
                 if message.type != aiohttp.WSMsgType.TEXT:
                     continue
@@ -605,7 +606,14 @@ async def _call_deepgram_evaluator_once(payload, provider_type, model, wav_bytes
                             return json.loads(arguments)
                     raise RuntimeError("QA agentı beklenmeyen bir function çağırdı.")
                 elif event_type == "ConversationText" and event.get("role") == "assistant":
-                    return _extract_json(event.get("content"))
+                    # Agent metni akış halinde parça parça gelebilir. İlk
+                    # parçada JSON parse etmeye çalışmak, fonksiyon çağrısı
+                    # sonradan gelse bile isteği gereksizce başarısız yapar.
+                    content = str(event.get("content") or "")
+                    if content:
+                        assistant_text_parts.append(content)
+                elif event_type == "AgentAudioDone" and assistant_text_parts:
+                    return _extract_json("".join(assistant_text_parts))
                 elif event_type == "Error":
                     detail = event.get("description") or event.get("message") or "Deepgram evaluator hatası."
                     raise RuntimeError(detail)
