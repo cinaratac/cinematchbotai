@@ -28,14 +28,6 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_QA_MODEL = os.environ.get(
     "VOICE_QA_OPENROUTER_MODEL", "openai/gpt-4o-mini"
 )
-OPENROUTER_QA_FALLBACK_MODEL = os.environ.get(
-    "VOICE_QA_OPENROUTER_FALLBACK_MODEL", "google/gemma-4-26b-a4b-it"
-)
-EVALUATION_MODEL = os.environ.get(
-    "VOICE_EVALUATION_MODEL", "gpt-4o-mini"
-)
-if not EVALUATION_MODEL.startswith("gpt-"):
-    EVALUATION_MODEL = "gpt-4o-mini"
 EVALUATION_TASKS = set()
 VOICE_EVALUATION_LOOP = None
 
@@ -900,10 +892,10 @@ async def evaluate_voice_session(
     # QA değerlendirmesi artık Deepgram Agent WebSocket'i değil, OpenRouter
     # Chat Completions REST API'sini kullanır. Deepgram yalnızca WAV -> STT
     # adımında kalır; canlı Voice Agent akışı bundan etkilenmez.
-    provider_chain = list(dict.fromkeys([
-        ("openrouter", OPENROUTER_QA_MODEL),
-        ("openrouter", OPENROUTER_QA_FALLBACK_MODEL),
-    ]))
+    # Tüm kalite puanlaması tek bir OpenRouter modeli tarafından yapılır.
+    # json_schema desteklenmezse kullanılan tool-call fallback'i de aynı
+    # model içindeki alternatif çıktı yöntemidir; başka modele geçilmez.
+    provider_chain = [("openrouter", OPENROUTER_QA_MODEL)]
     try:
         if wait_for_idle:
             print(
