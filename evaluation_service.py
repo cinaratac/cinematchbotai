@@ -1,6 +1,5 @@
 import asyncio
-import copy
-import hashlib
+from difflib import SequenceMatcher
 import json
 import os
 import re
@@ -30,9 +29,6 @@ if not EVALUATION_MODEL.startswith("gpt-"):
     EVALUATION_MODEL = "gpt-4o-mini"
 EVALUATION_TASKS = set()
 VOICE_EVALUATION_LOOP = None
-QA_EVALUATOR_VERSION = "deepgram-agent-websocket-v1"
-STT_REFERENCE_VERSION = "deepgram-nova-3-tr"
-TRANSCRIPT_METRIC_VERSION = "wer-token-v1"
 
 CRITERIA = {
     "speech_recognition_accuracy": (
@@ -88,8 +84,8 @@ Doğal ve akıcı gerçek assistant metni varsa naturalness puanını genel bir
 "doğal değildi" cümlesiyle düşürme. overall_score gözlenen kriterlerle ve
 sorunların gerçek kullanıcı etkisiyle tutarlı olmalıdır.
 
-Sonucu serbest metin olarak yazma. Structured Output JSON'unu aşağıdaki
-şemaya göre doldur:
+Sonucu serbest metin olarak yazma. Daima submit_evaluation fonksiyonunu çağır.
+Fonksiyon argümanlarını aşağıdaki şemaya göre doldur:
 {
   "overall_score": 0-100,
   "summary": "kısa yönetici özeti",
@@ -288,34 +284,6 @@ EVALUATION_FUNCTION = {
 }
 
 
-def _strict_json_schema(schema):
-    """Responses Structured Outputs için şemayı strict uyumlu hale getir."""
-    value = copy.deepcopy(schema)
-    if value.get("type") == "object":
-        properties = value.get("properties", {})
-        value["additionalProperties"] = False
-        value["required"] = list(properties)
-        value["properties"] = {
-            key: _strict_json_schema(item)
-            for key, item in properties.items()
-        }
-    if value.get("type") == "array" and isinstance(value.get("items"), dict):
-        value["items"] = _strict_json_schema(value["items"])
-    if isinstance(value.get("anyOf"), list):
-        value["anyOf"] = [
-            _strict_json_schema(item) for item in value["anyOf"]
-        ]
-    return value
-
-
-EVALUATION_JSON_SCHEMA = _strict_json_schema(
-    EVALUATION_FUNCTION["parameters"]
-)
-QA_PROMPT_VERSION = hashlib.sha256(
-    EVALUATOR_PROMPT.encode("utf-8")
-).hexdigest()[:12]
-
-
 def _extract_json(text):
     clean = str(text or "").strip()
     clean = re.sub(r"^```(?:json)?\s*", "", clean, flags=re.IGNORECASE)
@@ -333,62 +301,17 @@ def _normalize_transcript(text):
     return " ".join(normalized.split())
 
 
-def _transcript_wer(audio_text, logged_user_texts):
-    """İki STT çıktısındaki token düzeyi edit mesafesini ölç.
-
-    Bağımsız STT insan doğrulamalı ground truth değildir; bu değer iki motor
-    arasındaki anlaşmazlığı ölçer. WER = (S + D + I) / referans_token_sayısı.
-    """
+def _transcript_match_score(audio_text, logged_user_texts):
+    """İki STT çıktısının deterministik kelime dizisi benzerliği."""
     audio_words = _normalize_transcript(audio_text).split()
     logged_words = _normalize_transcript(
         " ".join(str(text or "") for text in logged_user_texts)
     ).split()
-    if not audio_words:
-        return {
-            "reference_word_count": 0,
-            "hypothesis_word_count": len(logged_words),
-            "substitutions": 0,
-            "deletions": 0,
-            "insertions": len(logged_words),
-            "wer": None,
-            "match_score": 0,
-        }
-
-    # Hücre: (toplam hata, substitution, deletion, insertion). Eşitlikte
-    # substitution yerine deletion/insertion tercih edilmez; hata türü izlenir.
-    matrix = [[(0, 0, 0, 0)] * (len(logged_words) + 1)
-              for _ in range(len(audio_words) + 1)]
-    for index in range(1, len(audio_words) + 1):
-        matrix[index][0] = (index, 0, index, 0)
-    for index in range(1, len(logged_words) + 1):
-        matrix[0][index] = (index, 0, 0, index)
-    for audio_index, audio_word in enumerate(audio_words, start=1):
-        for logged_index, logged_word in enumerate(logged_words, start=1):
-            if audio_word == logged_word:
-                matrix[audio_index][logged_index] = matrix[
-                    audio_index - 1
-                ][logged_index - 1]
-                continue
-            previous = matrix[audio_index - 1][logged_index - 1]
-            substitute = (previous[0] + 1, previous[1] + 1, previous[2], previous[3])
-            previous = matrix[audio_index - 1][logged_index]
-            delete = (previous[0] + 1, previous[1], previous[2] + 1, previous[3])
-            previous = matrix[audio_index][logged_index - 1]
-            insert = (previous[0] + 1, previous[1], previous[2], previous[3] + 1)
-            matrix[audio_index][logged_index] = min(
-                substitute, delete, insert, key=lambda item: item[0]
-            )
-    _, substitutions, deletions, insertions = matrix[-1][-1]
-    wer = (substitutions + deletions + insertions) / len(audio_words)
-    return {
-        "reference_word_count": len(audio_words),
-        "hypothesis_word_count": len(logged_words),
-        "substitutions": substitutions,
-        "deletions": deletions,
-        "insertions": insertions,
-        "wer": round(wer, 4),
-        "match_score": round(max(0, 1 - wer) * 100),
-    }
+    if not audio_words or not logged_words:
+        return 0
+    return round(
+        SequenceMatcher(None, audio_words, logged_words).ratio() * 100
+    )
 
 
 def _contains_quoted_evidence(source_text, claimed_text):
@@ -610,7 +533,7 @@ async def _call_deepgram_evaluator_once(payload, provider_type, model):
         "Voice QA Deepgram isteği:",
         f"provider={provider_type}",
         f"model={model}",
-        f"prompt_version={QA_PROMPT_VERSION}",
+        f"system_prompt_chars={len(EVALUATOR_PROMPT)}",
         f"payload_chars={len(serialized_payload)}",
     )
     timeout = aiohttp.ClientTimeout(total=90)
@@ -753,18 +676,16 @@ async def evaluate_voice_session(session_id, recording_id):
         logged_user_texts = [
             turn["user"] for turn in turns if turn.get("user")
         ]
-        transcript_wer = _transcript_wer(
+        deterministic_match_score = _transcript_match_score(
             audio_transcript,
             logged_user_texts,
         )
-        deterministic_match_score = transcript_wer["match_score"]
         evaluation_payload = {
             "criteria": CRITERIA,
             "audio_transcript": audio_transcript,
             "audio_utterances": audio_result["utterances"],
             "logged_transcript": turns,
             "deterministic_match_score": deterministic_match_score,
-            "transcript_disagreement": transcript_wer,
             "performance_metrics_ms": performance_summary,
             "barge_in_metrics": {
                 "average_latency_ms": performance_summary.get(
@@ -820,11 +741,6 @@ async def evaluate_voice_session(session_id, recording_id):
         result = _validate_result(raw_result)
         result["evaluator_provider"] = used_provider
         result["evaluator_model"] = used_model
-        result["qa_evaluator_version"] = QA_EVALUATOR_VERSION
-        result["qa_prompt_version"] = QA_PROMPT_VERSION
-        result["stt_reference_version"] = STT_REFERENCE_VERSION
-        result["transcript_metric_version"] = TRANSCRIPT_METRIC_VERSION
-        result["transcript_disagreement"] = transcript_wer
         result["audio_transcript"] = audio_transcript
         result["logged_user_transcript"] = logged_user_texts
         await asyncio.to_thread(
