@@ -653,7 +653,10 @@ async def _call_openrouter_evaluator_once(payload, model, use_tools=False):
         "model": model,
         "messages": messages,
         "temperature": 0,
-        "max_tokens": 6000,
+        # OpenRouter hesabındaki mevcut kredi sınırının altında kalır;
+        # transkript/prompt kısaltılmaz, yalnızca modelin JSON çıktısı
+        # için ayrılan üst sınır kontrol edilir.
+        "max_tokens": 4500,
     }
     if use_tools:
         request_payload["tools"] = [{
