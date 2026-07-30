@@ -101,6 +101,31 @@ def overview():
     return jsonify({"status": "success", "data": data}), 200
 
 
+@admin_bp.route("/outcomes", methods=["GET"])
+@require_admin_key
+def outcome_analytics():
+    try:
+        days = int(request.args.get("days", 30))
+    except (TypeError, ValueError):
+        days = 30
+    days = max(1, min(days, 365))
+
+    try:
+        limit = int(request.args.get("limit", 50))
+    except (TypeError, ValueError):
+        limit = 50
+    limit = max(1, min(limit, 200))
+
+    data = db.get_outcome_analytics_admin(
+        days=days,
+        limit=limit,
+        intent=request.args.get("intent") or None,
+        outcome=request.args.get("outcome") or None,
+        channel=request.args.get("channel") or None,
+    )
+    return jsonify({"status": "success", "data": data}), 200
+
+
 @admin_bp.route("/voice-qa/dashboard", methods=["GET"])
 @require_admin_key
 def voice_qa_dashboard():

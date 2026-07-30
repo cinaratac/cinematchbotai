@@ -9,6 +9,7 @@ from aiortc import RTCPeerConnection, RTCSessionDescription, MediaStreamTrack
 from av import AudioFrame
 from av.audio.resampler import AudioResampler
 
+from database import get_or_create_session, log_chat, touch_session
 from voice.config import (
     DEEPGRAM_API_KEY,
     PEER_CONNECTIONS,
@@ -149,6 +150,46 @@ async def handle_user_speech(track, pc, user_context, output_track):
     drop_interrupted_audio = False
     new_response_started = False
     interrupted_user_committed = False
+    pending_user_text = None
+    turn_user_text = None
+    pending_assistant_chunks = []
+    persistence_tasks = set()
+
+    def track_persistence_task(task):
+        persistence_tasks.discard(task)
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error:
+            print("WebRTC konuşma kayıt hatası:", repr(error))
+
+    async def persist_turn(user_text, assistant_text):
+        session_id = user_context.get("session_id")
+        if not session_id:
+            return
+        logged = await asyncio.to_thread(
+            log_chat,
+            session_id,
+            user_context["user_id"],
+            user_context["username"],
+            user_text,
+            assistant_text,
+            channel="voice_webrtc",
+            input_type="streaming_audio",
+        )
+        await asyncio.to_thread(touch_session, session_id, logged)
+
+    def flush_completed_turn():
+        nonlocal turn_user_text, pending_assistant_chunks
+        if turn_user_text and pending_assistant_chunks:
+            assistant_text = " ".join(pending_assistant_chunks)
+            task = asyncio.create_task(
+                persist_turn(turn_user_text, assistant_text)
+            )
+            persistence_tasks.add(task)
+            task.add_done_callback(track_persistence_task)
+        turn_user_text = None
+        pending_assistant_chunks = []
 
     def send_control(action):
         channel = user_context.get("control_channel")
@@ -259,15 +300,17 @@ async def handle_user_speech(track, pc, user_context, output_track):
                         send_task = asyncio.create_task(send_microphone())
                     elif event_type == "ConversationText":
                         role = event.get("role", "unknown")
-                        content = event.get("content", "")
+                        content = str(event.get("content") or "").strip()
                         print(f"[{role}]: {content}")
-                        if role == "user" and content.strip():
+                        if role == "user" and content:
+                            flush_completed_turn()
+                            pending_user_text = content
                             # Araya giren kullanıcının yeni cümlesi Deepgram
                             # tarafından kesinleştirildi. Bundan sonra gelecek
                             # ilk assistant parçası yeni cevaba aittir.
                             if drop_interrupted_audio:
                                 interrupted_user_committed = True
-                        elif role == "assistant" and content.strip():
+                        elif role == "assistant" and content:
                             if (
                                 drop_interrupted_audio
                                 and not interrupted_user_committed
@@ -287,6 +330,10 @@ async def handle_user_speech(track, pc, user_context, output_track):
                                     send_control("resume")
                                 drop_interrupted_audio = False
                                 interrupted_user_committed = False
+                                if turn_user_text is None:
+                                    turn_user_text = pending_user_text
+                                pending_user_text = None
+                                pending_assistant_chunks.append(content)
                     elif event_type == "UserStartedSpeaking":
                         # Barge-in: mevcut cevabı anında kes ve eski cevabın
                         # geç gelebilecek TTS paketlerini kabul etme. Mikrofon
@@ -313,6 +360,7 @@ async def handle_user_speech(track, pc, user_context, output_track):
                         print("[Deepgram] CineMatch konuşuyor...")
                     elif event_type == "AgentAudioDone":
                         await output_track.mark_utterance_done()
+                        flush_completed_turn()
                         print("[Deepgram] Ajan ses yanıtı tamamlandı.")
                     elif event_type == "LatencyReport":
                         print("[Deepgram Metrik]:", event)
@@ -329,6 +377,10 @@ async def handle_user_speech(track, pc, user_context, output_track):
                         pass
     except Exception as e:
         print("Deepgram Voice Agent Bağlantı Hatası:", repr(e))
+    finally:
+        flush_completed_turn()
+        if persistence_tasks:
+            await asyncio.gather(*persistence_tasks, return_exceptions=True)
 
 
 async def offer(request):
@@ -384,7 +436,18 @@ async def offer(request):
         },
         "control_channel": None,
         "client_interrupt_pending": False,
+        "session_id": None,
     }
+    try:
+        user_context["session_id"] = await asyncio.to_thread(
+            get_or_create_session,
+            user_context["user_id"],
+            user_context["username"],
+        )
+    except Exception as session_error:
+        # Eski WebRTC ses hattı veritabanı geçici olarak kullanılamadığında da
+        # çalışabilsin; yalnızca bu görüşmenin kalıcı logu atlanır.
+        print("WebRTC oturumu oluşturulamadı:", repr(session_error))
 
     @pc.on("datachannel")
     def on_datachannel(channel):

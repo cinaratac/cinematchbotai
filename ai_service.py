@@ -19,6 +19,12 @@ from database import (
     SUMMARY_UPDATE_INTERVAL,
 )
 from app_guide import CINEMATCH_APP_GUIDE
+from outcome_service import (
+    OUTCOME_FALLBACK,
+    OUTCOME_PARTIAL_SUCCESS,
+    OUTCOME_TECHNICAL_ERROR,
+    categorize_interaction,
+)
 
 # --- GİZLİ ANAHTARLAR: ortam değişkenlerinden okunuyor. Render'da
 # "Environment" sekmesinden şunları tanımlaman gerekiyor:
@@ -514,6 +520,8 @@ def get_ai_response(
     movie_name=None,
     include_diagnostics=False,
     allow_stateless=False,
+    channel="unknown",
+    input_type="text",
 ):
     # 1. OTURUMU BUL / OLUŞTUR (session bazlı yapı)
     stateless = False
@@ -529,6 +537,9 @@ def get_ai_response(
             f"bu istek stateless çalışacak: {e}"
         )
     tool_timings = []
+    outcome_hint = None
+    error_stage = None
+    error_type = None
 
     # Uygulama sorularında rehberi modelden önce deterministik olarak çağır.
     # Rehber yalnızca ilgili mesajlarda prompt'a eklenir ve admin tool logunda
@@ -732,6 +743,9 @@ sohbetin doğal devamıymış gibi bak, aynı cümleleri tekrar etme.
             error_info = response_data.get('error', {})
             error_code = error_info.get('code')
             print("OPENROUTER'DAN GELEN HATA:", response_data)
+            outcome_hint = OUTCOME_TECHNICAL_ERROR
+            error_stage = "openrouter"
+            error_type = f"OpenRouterError:{error_code or 'unknown'}"
 
             if error_code == 429:
                 # Rate-limit
@@ -754,6 +768,7 @@ sohbetin doğal devamıymış gibi bak, aynı cümleleri tekrar etme.
                     if not movie_name:
                         # Zorunlu tool_choice modeli aracı çağırmaya itti ama hangi film olduğunu çıkaramadı 
                         final_answer = "Hangi filmden bahsediyorsun, film adını yazabilir misin?"
+                        outcome_hint = OUTCOME_FALLBACK
                     else:
                         print(f"SİSTEM: Yapay zeka OMDb'den şu filmi çekiyor: {movie_name}")
                         function_result = get_live_movie_data(
@@ -773,7 +788,24 @@ sohbetin doğal devamıymış gibi bak, aynı cümleleri tekrar etme.
                         })
 
                         second_response_data = _call_openrouter(messages, tools=tools)
-                        final_answer = second_response_data['choices'][0]['message']['content']
+                        if "choices" not in second_response_data:
+                            second_error = second_response_data.get("error", {})
+                            second_code = second_error.get("code")
+                            outcome_hint = OUTCOME_TECHNICAL_ERROR
+                            error_stage = "openrouter_after_tool"
+                            error_type = (
+                                f"OpenRouterError:{second_code or 'unknown'}"
+                            )
+                            final_answer = (
+                                "Üzgünüm, film verisini aldıktan sonra yanıtı "
+                                "oluştururken teknik bir sorun yaşadım. "
+                                "Birazdan tekrar dener misin?"
+                            )
+                        else:
+                            final_answer = (
+                                second_response_data["choices"][0]["message"]
+                                .get("content") or ""
+                            )
                 else:
                     final_answer = assistant_message.get('content') or ""
             else:
@@ -781,20 +813,56 @@ sohbetin doğal devamıymış gibi bak, aynı cümleleri tekrar etme.
 
     except Exception as e:
         final_answer = f"Üzgünüm, bir sistem hatası oluştu: {str(e)}"
+        outcome_hint = OUTCOME_TECHNICAL_ERROR
+        error_stage = error_stage or "ai_or_tool"
+        error_type = type(e).__name__
 
     if not final_answer or final_answer.strip() == "":
         final_answer = "⚠️ Üzgünüm, yapay zeka modeli boş bir cevap döndürdü."
+        outcome_hint = outcome_hint or OUTCOME_FALLBACK
 
     # YENİ: Model film önerdiyse cevabın sonuna eklediği [[FILMLER: ...]]
     # bloğunu ayıklayıp görünür metni ve tıklanabilir film listesini ayır.
     final_answer, recommended_movies = extract_movie_recommendations(final_answer)
 
+    if (
+        outcome_hint is None
+        and any(timing.get("status") == "error" for timing in tool_timings)
+    ):
+        outcome_hint = OUTCOME_PARTIAL_SUCCESS
+
+    classification = categorize_interaction(
+        user_message,
+        final_answer,
+        input_type=input_type,
+        recommended_movies=recommended_movies,
+        outcome_hint=outcome_hint,
+        error_stage=error_stage,
+        error_type=error_type,
+        tool_calls=tool_timings,
+    )
+    chat_log_id = None
+
     # 5. TAM KONUŞMA DÖKÜMÜNE KAYDET 
     if not stateless:
-        log_chat(session_id, user_id, username, user_message, final_answer)
+        logged = log_chat(
+            session_id,
+            user_id,
+            username,
+            user_message,
+            final_answer,
+            channel=channel,
+            input_type=input_type,
+            classification=classification,
+            recommended_movies=recommended_movies,
+            error_stage=error_stage,
+            error_type=error_type,
+            tool_calls=tool_timings,
+        )
+        chat_log_id = logged["id"]
 
         # 6. OTURUM SAYACINI GÜNCELLE
-        message_count = touch_session(session_id)
+        message_count = touch_session(session_id, classification)
 
         # 7. BELİRLİ ARALIKLARLA ÖZETİ GÜNCELLEYEN ARACI TETİKLE
         if message_count % SUMMARY_UPDATE_INTERVAL == 0:
@@ -809,6 +877,8 @@ sohbetin doğal devamıymış gibi bak, aynı cümleleri tekrar etme.
                 if tool_timings
                 else None
             ),
+            "chat_log_id": chat_log_id,
+            **classification,
         }
     return final_answer, recommended_movies, session_id
 
@@ -818,7 +888,14 @@ sohbetin doğal devamıymış gibi bak, aynı cümleleri tekrar etme.
 
 
 
-def analyze_image(image_base64, caption, user_id="anon", username="anon"):
+def analyze_image(
+    image_base64,
+    caption,
+    user_id="anon",
+    username="anon",
+    include_diagnostics=False,
+    channel="unknown",
+):
     """image_base64: Telegram'dan indirilen fotoğrafın base64 (data URL'siz) hali.
     caption: kullanıcının fotoğrafla birlikte yazdığı yazı (yoksa None/boş olabilir)."""
 
@@ -877,12 +954,20 @@ KULLANICI GEÇMİŞİ (arka plan):
     ]
 
     final_answer = ""
+    outcome_hint = None
+    error_stage = None
+    error_type = None
     try:
         response_data = _call_openrouter(messages, model=VISION_MODEL_NAME)
 
         if 'choices' not in response_data:
             error_info = response_data.get('error', {})
             print("OPENROUTER'DAN GELEN HATA (görüntü):", response_data)
+            outcome_hint = OUTCOME_TECHNICAL_ERROR
+            error_stage = "vision_openrouter"
+            error_type = (
+                f"OpenRouterError:{error_info.get('code') or 'unknown'}"
+            )
             if error_info.get('code') == 429:
                 final_answer = ("Şu anda yoğunluk var, fotoğrafı analiz edemedim. "
                                  "Birkaç saniye sonra tekrar gönderir misin?")
@@ -893,17 +978,45 @@ KULLANICI GEÇMİŞİ (arka plan):
 
     except Exception as e:
         final_answer = f"Üzgünüm, fotoğrafı analiz ederken bir sistem hatası oluştu: {str(e)}"
+        outcome_hint = OUTCOME_TECHNICAL_ERROR
+        error_stage = "vision_openrouter"
+        error_type = type(e).__name__
 
     if not final_answer or final_answer.strip() == "":
         final_answer = "⚠️ Üzgünüm, fotoğraf için boş bir cevap döndü, tekrar dener misin?"
+        outcome_hint = outcome_hint or OUTCOME_FALLBACK
 
     log_message = "[FOTOĞRAF]" + (f" - {caption}" if caption else "")
-    log_chat(session_id, user_id, username, log_message, final_answer)
+    classification = categorize_interaction(
+        log_message,
+        final_answer,
+        input_type="photo",
+        outcome_hint=outcome_hint,
+        error_stage=error_stage,
+        error_type=error_type,
+    )
+    logged = log_chat(
+        session_id,
+        user_id,
+        username,
+        log_message,
+        final_answer,
+        channel=channel,
+        input_type="photo",
+        classification=classification,
+        error_stage=error_stage,
+        error_type=error_type,
+    )
 
-    message_count = touch_session(session_id)
+    message_count = touch_session(session_id, classification)
     if message_count % SUMMARY_UPDATE_INTERVAL == 0:
         summarize_session(session_id)
 
+    if include_diagnostics:
+        return final_answer, session_id, {
+            "chat_log_id": logged["id"],
+            **classification,
+        }
     return final_answer
 def _call_openrouter_stream(messages, model=None):
     """

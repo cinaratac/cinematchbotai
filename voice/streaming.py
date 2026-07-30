@@ -232,7 +232,7 @@ async def voice_stream(request):
                         print("Voice metrik/veritabanı kayıt hatası:", repr(error))
 
                 async def persist_turn(user_text, assistant_text):
-                    await asyncio.to_thread(
+                    logged = await asyncio.to_thread(
                         log_chat,
                         session_id,
                         user_id,
@@ -240,8 +240,14 @@ async def voice_stream(request):
                         user_text,
                         assistant_text,
                         recording.recording_id if recording else None,
+                        channel="voice_websocket",
+                        input_type="streaming_audio",
                     )
-                    await asyncio.to_thread(touch_session, session_id)
+                    await asyncio.to_thread(
+                        touch_session,
+                        session_id,
+                        logged,
+                    )
 
                 def flush_pending_assistant_turn():
                     """Birikmiş asistan cevabı parçalarını tek bir tur olarak

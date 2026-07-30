@@ -19,7 +19,18 @@ from database import (
     setup_database,
     get_session_admin_detail,
     add_evaluation,
+    get_or_create_session,
+    log_chat,
+    log_failed_interaction,
     log_performance_metric,
+    touch_session,
+    update_chat_outcome,
+)
+from outcome_service import (
+    OUTCOME_OUT_OF_SCOPE,
+    OUTCOME_PARTIAL_SUCCESS,
+    OUTCOME_SUCCESS,
+    OUTCOME_TECHNICAL_ERROR,
 )
 
 
@@ -88,7 +99,25 @@ if bot:
 
     @bot.message_handler(commands=['start'])
     def send_welcome(message):
-        bot.reply_to(message, "Merhaba! Ben staj yapan bir adamın ürettiği demoyum")
+        answer = "Merhaba! Ben staj yapan bir adamın ürettiği demoyum"
+        bot.reply_to(message, answer)
+        username = (
+            message.from_user.username or message.from_user.first_name
+        )
+        try:
+            session_id = get_or_create_session(message.from_user.id, username)
+            logged = log_chat(
+                session_id,
+                message.from_user.id,
+                username,
+                "/start",
+                answer,
+                channel="telegram",
+                input_type="command",
+            )
+            touch_session(session_id, logged)
+        except Exception as log_error:
+            print("START MESAJI LOG HATASI:", log_error)
 
     @bot.message_handler(content_types=['photo'])
     def handle_photo(message):
@@ -101,6 +130,7 @@ if bot:
 
         username = message.from_user.username if message.from_user.username else message.from_user.first_name
 
+        diagnostics = None
         try:
             file_id = message.photo[-1].file_id
             file_info = bot.get_file(file_id)
@@ -109,12 +139,53 @@ if bot:
 
             caption = message.caption
 
-            answer = analyze_image(image_base64, caption, user_id=message.from_user.id, username=username)
+            answer, _session_id, diagnostics = analyze_image(
+                image_base64,
+                caption,
+                user_id=message.from_user.id,
+                username=username,
+                include_diagnostics=True,
+                channel="telegram",
+            )
         except Exception as e:
             print("FOTOĞRAF İŞLEME HATASI:", e)
             answer = "Üzgünüm, fotoğrafı işlerken bir sorun oluştu, tekrar gönderir misin?"
+            try:
+                failed = log_failed_interaction(
+                    message.from_user.id,
+                    username,
+                    "[FOTOĞRAF]" + (f" - {message.caption}" if message.caption else ""),
+                    answer,
+                    channel="telegram",
+                    input_type="photo",
+                    error_stage="telegram_photo_processing",
+                    error_type=type(e).__name__,
+                )
+                diagnostics = {
+                    "chat_log_id": failed["id"],
+                    "outcome": failed["outcome"],
+                }
+            except Exception as log_error:
+                print("FOTOĞRAF HATA LOGU KAYDEDİLEMEDİ:", log_error)
 
-        bot.edit_message_text(chat_id=message.chat.id, message_id=msg.message_id, text=answer)
+        try:
+            bot.edit_message_text(
+                chat_id=message.chat.id,
+                message_id=msg.message_id,
+                text=answer,
+            )
+        except Exception as send_error:
+            print("FOTOĞRAF CEVABI GÖNDERİLEMEDİ:", send_error)
+            if diagnostics and diagnostics.get("chat_log_id"):
+                try:
+                    update_chat_outcome(
+                        diagnostics["chat_log_id"],
+                        OUTCOME_TECHNICAL_ERROR,
+                        error_stage="telegram_photo_send",
+                        error_type=type(send_error).__name__,
+                    )
+                except Exception as update_error:
+                    print("FOTOĞRAF OUTCOME GÜNCELLENEMEDİ:", update_error)
 
     @bot.message_handler(content_types=['voice', 'audio'])
     def handle_audio(message):
@@ -162,6 +233,8 @@ if bot:
 
         msg = bot.reply_to(message, "Sesini dinliyorum...")
         username = message.from_user.username or message.from_user.first_name
+        transcript = None
+        diagnostics = None
 
         try:
             media = message.voice if message.content_type == 'voice' else message.audio
@@ -208,6 +281,8 @@ if bot:
                 user_id=message.from_user.id,
                 username=username,
                 include_diagnostics=True,
+                channel="telegram",
+                input_type=message.content_type,
             )
             metrics["ai_ms"] = round((time.perf_counter() - ai_started) * 1000)
             metrics["ai_ready_ms"] = round((time.perf_counter() - pipeline_started) * 1000)
@@ -216,6 +291,8 @@ if bot:
             metrics["tool_call_count"] = diagnostics["tool_call_count"]
             metrics["tool_total_ms"] = diagnostics["tool_total_ms"]
             metrics["tool_calls"] = diagnostics["tool_calls"]
+            metrics["intent"] = diagnostics["intent"]
+            metrics["outcome"] = diagnostics["outcome"]
 
             current_stage = "telegram_text_send"
             text_send_started = time.perf_counter()
@@ -270,13 +347,59 @@ if bot:
                 metrics["e2e_ms"] = round(
                     (time.perf_counter() - pipeline_started) * 1000
                 )
+                if diagnostics and diagnostics.get("chat_log_id"):
+                    try:
+                        changed = update_chat_outcome(
+                            diagnostics["chat_log_id"],
+                            OUTCOME_PARTIAL_SUCCESS,
+                            error_stage=current_stage,
+                            error_type=type(tts_error).__name__,
+                            only_if_outcomes={
+                                OUTCOME_SUCCESS,
+                                OUTCOME_OUT_OF_SCOPE,
+                            },
+                        )
+                        if changed:
+                            metrics["outcome"] = OUTCOME_PARTIAL_SUCCESS
+                    except Exception as update_error:
+                        print("SES OUTCOME GÜNCELLENEMEDİ:", update_error)
                 save_metrics()
         except Exception as e:
             print("SES İŞLEME HATASI:", e)
             metrics["status"] = "error"
             metrics["failed_stage"] = current_stage
             metrics["error_type"] = type(e).__name__
+            metrics["outcome"] = OUTCOME_TECHNICAL_ERROR
             metrics["e2e_ms"] = round((time.perf_counter() - pipeline_started) * 1000)
+            if diagnostics and diagnostics.get("chat_log_id"):
+                try:
+                    update_chat_outcome(
+                        diagnostics["chat_log_id"],
+                        OUTCOME_TECHNICAL_ERROR,
+                        error_stage=current_stage,
+                        error_type=type(e).__name__,
+                    )
+                except Exception as update_error:
+                    print("SES OUTCOME GÜNCELLENEMEDİ:", update_error)
+            else:
+                try:
+                    failed = log_failed_interaction(
+                        message.from_user.id,
+                        username,
+                        transcript or "[SES MESAJI - transkript alınamadı]",
+                        (
+                            "Üzgünüm, sesini anlayamadım. Biraz daha net "
+                            "konuşup tekrar gönderir misin?"
+                        ),
+                        channel="telegram",
+                        input_type=message.content_type,
+                        error_stage=current_stage,
+                        error_type=type(e).__name__,
+                    )
+                    metrics["session_id"] = failed["session_id"]
+                    metrics["intent"] = failed["intent"]
+                except Exception as log_error:
+                    print("SES HATA LOGU KAYDEDİLEMEDİ:", log_error)
             save_metrics()
             bot.edit_message_text(
                 chat_id=message.chat.id,
@@ -313,6 +436,7 @@ if bot:
             "failed_stage": None,
             "error_type": None,
         }
+        diagnostics = None
 
         try:
             ai_started = time.perf_counter()
@@ -321,6 +445,8 @@ if bot:
                 user_id=message.from_user.id,
                 username=username,
                 include_diagnostics=True,
+                channel="telegram",
+                input_type="text",
             )
             metrics["ai_ms"] = round((time.perf_counter() - ai_started) * 1000)
             metrics["ai_ready_ms"] = round(
@@ -330,6 +456,8 @@ if bot:
             metrics["tool_call_count"] = diagnostics["tool_call_count"]
             metrics["tool_total_ms"] = diagnostics["tool_total_ms"]
             metrics["tool_calls"] = diagnostics["tool_calls"]
+            metrics["intent"] = diagnostics["intent"]
+            metrics["outcome"] = diagnostics["outcome"]
             metrics["answer_length"] = len(answer)
 
             send_started = time.perf_counter()
@@ -352,10 +480,40 @@ if bot:
                 "telegram_text_send" if metrics["ai_ready_ms"] is not None else "ai"
             )
             metrics["error_type"] = type(e).__name__
+            metrics["outcome"] = OUTCOME_TECHNICAL_ERROR
             metrics["e2e_ms"] = round(
                 (time.perf_counter() - pipeline_started) * 1000
             )
             print("TELEGRAM METİN İŞLEME HATASI:", e)
+            if diagnostics and diagnostics.get("chat_log_id"):
+                try:
+                    update_chat_outcome(
+                        diagnostics["chat_log_id"],
+                        OUTCOME_TECHNICAL_ERROR,
+                        error_stage=metrics["failed_stage"],
+                        error_type=type(e).__name__,
+                    )
+                except Exception as update_error:
+                    print("METİN OUTCOME GÜNCELLENEMEDİ:", update_error)
+            else:
+                try:
+                    failed = log_failed_interaction(
+                        message.from_user.id,
+                        username,
+                        message.text or "",
+                        (
+                            "Üzgünüm, mesajını işlerken bir sorun oluştu. "
+                            "Tekrar dener misin?"
+                        ),
+                        channel="telegram",
+                        input_type="text",
+                        error_stage=metrics["failed_stage"],
+                        error_type=type(e).__name__,
+                    )
+                    metrics["session_id"] = failed["session_id"]
+                    metrics["intent"] = failed["intent"]
+                except Exception as log_error:
+                    print("METİN HATA LOGU KAYDEDİLEMEDİ:", log_error)
             try:
                 bot.edit_message_text(
                     chat_id=message.chat.id,
@@ -411,6 +569,7 @@ def api_chat():
         "failed_stage": None,
         "error_type": None,
     }
+    diagnostics = None
 
     # YENİ: Cinematch uygulamasından gelen zevk profili (opsiyonel).
     # Flutter tarafı bunu her istekte gönderiyor; hiçbiri yoksa boş liste
@@ -431,6 +590,8 @@ def api_chat():
             app_profile=app_profile,
             movie_name=data.get('movie_name') or data.get('movie_title'),
             include_diagnostics=True,
+            channel="api",
+            input_type="text",
         )
         metrics["ai_ms"] = round((time.perf_counter() - ai_started) * 1000)
         metrics["ai_ready_ms"] = round(
@@ -440,6 +601,8 @@ def api_chat():
         metrics["tool_call_count"] = diagnostics["tool_call_count"]
         metrics["tool_total_ms"] = diagnostics["tool_total_ms"]
         metrics["tool_calls"] = diagnostics["tool_calls"]
+        metrics["intent"] = diagnostics["intent"]
+        metrics["outcome"] = diagnostics["outcome"]
         metrics["answer_length"] = len(ai_response)
         # Flask cevabı streaming değil; backend tarafında TTFB, JSON cevabının
         # dönmeye hazır olduğu andır. Ağ ve istemcide render süresi dahil değildir.
@@ -458,14 +621,43 @@ def api_chat():
             "bot_response": ai_response,
             "recommended_movies": recommended_movies,
             "session_id": session_id,
+            "intent": diagnostics["intent"],
+            "outcome": diagnostics["outcome"],
         }), 200
     except Exception as e:
         metrics["status"] = "error"
         metrics["failed_stage"] = "ai"
         metrics["error_type"] = type(e).__name__
+        metrics["outcome"] = OUTCOME_TECHNICAL_ERROR
         metrics["e2e_ms"] = round(
             (time.perf_counter() - pipeline_started) * 1000
         )
+        if diagnostics and diagnostics.get("chat_log_id"):
+            try:
+                update_chat_outcome(
+                    diagnostics["chat_log_id"],
+                    OUTCOME_TECHNICAL_ERROR,
+                    error_stage="api_response",
+                    error_type=type(e).__name__,
+                )
+            except Exception as update_error:
+                print("API OUTCOME GÜNCELLENEMEDİ:", update_error)
+        else:
+            try:
+                failed = log_failed_interaction(
+                    user_id,
+                    username,
+                    user_message,
+                    "İstek teknik bir hata nedeniyle tamamlanamadı.",
+                    channel="api",
+                    input_type="text",
+                    error_stage="ai",
+                    error_type=type(e).__name__,
+                )
+                metrics["session_id"] = failed["session_id"]
+                metrics["intent"] = failed["intent"]
+            except Exception as log_error:
+                print("API HATA LOGU KAYDEDİLEMEDİ:", log_error)
         try:
             log_performance_metric(metrics)
         except Exception as metric_error:

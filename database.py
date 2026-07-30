@@ -6,6 +6,11 @@ from datetime import datetime, timedelta, timezone
 import firebase_admin
 from firebase_admin import credentials, firestore, storage
 from google.cloud.firestore_v1 import FieldFilter
+from outcome_service import (
+    OUTCOME_TECHNICAL_ERROR,
+    VALID_OUTCOMES,
+    categorize_interaction,
+)
 
 # Oturum süresi
 SESSION_TIMEOUT_MINUTES = 30
@@ -125,18 +130,32 @@ def get_or_create_session(user_id, username):
         "is_active": True,
         "rating_sum": 0,
         "rating_count": 0,
+        "intent_counts": {},
+        "outcome_counts": {},
+        "last_intent": None,
+        "last_outcome": None,
     })
     print(f"SİSTEM: Kullanıcı {user_id} için yeni oturum açıldı -> session_id={new_doc.id}")
     return new_doc.id
 
 
-def touch_session(session_id):
+def touch_session(session_id, classification=None):
     db = _get_db()
     ref = db.collection(COL_SESSIONS).document(session_id)
-    ref.update({
+    updates = {
         "last_active_at": _now(),
         "message_count": firestore.Increment(1),
-    })
+    }
+    if classification:
+        intent = classification.get("intent")
+        outcome = classification.get("outcome")
+        if intent:
+            updates[f"intent_counts.{intent}"] = firestore.Increment(1)
+            updates["last_intent"] = intent
+        if outcome:
+            updates[f"outcome_counts.{outcome}"] = firestore.Increment(1)
+            updates["last_outcome"] = outcome
+    ref.update(updates)
     snap = ref.get()
     data = snap.to_dict() or {}
     return data.get("message_count", 0)
@@ -159,7 +178,26 @@ def log_chat(
     user_message,
     bot_response,
     recording_id=None,
+    *,
+    channel="unknown",
+    input_type="text",
+    classification=None,
+    recommended_movies=None,
+    outcome_hint=None,
+    error_stage=None,
+    error_type=None,
+    tool_calls=None,
 ):
+    classification = classification or categorize_interaction(
+        user_message,
+        bot_response,
+        input_type=input_type,
+        recommended_movies=recommended_movies,
+        outcome_hint=outcome_hint,
+        error_stage=error_stage,
+        error_type=error_type,
+        tool_calls=tool_calls,
+    )
     db = _get_db()
     payload = {
         "session_id": session_id,
@@ -167,12 +205,99 @@ def log_chat(
         "username": username,
         "user_message": user_message,
         "bot_response": bot_response,
+        "channel": channel,
+        "input_type": input_type,
+        **classification,
         "created_at": _now(),
     }
     if recording_id:
         payload["recording_id"] = recording_id
-    db.collection(COL_CHAT_LOGS).document().set(payload)
+    if recommended_movies:
+        payload["recommended_movies"] = list(recommended_movies)[:3]
+    if error_stage:
+        payload["error_stage"] = str(error_stage)[:120]
+    if error_type:
+        payload["error_type"] = str(error_type)[:200]
+    doc_ref = db.collection(COL_CHAT_LOGS).document()
+    doc_ref.set(payload)
     print("LOG BAŞARILI: Mesaj Firestore'a kaydedildi.")
+    return {"id": doc_ref.id, **classification}
+
+
+def log_failed_interaction(
+    user_id,
+    username,
+    user_message,
+    bot_response,
+    *,
+    channel,
+    input_type,
+    error_stage,
+    error_type,
+):
+    """Ana cevap hattına giremeden biten bir isteği teknik hata olarak kaydeder.
+
+    Veritabanının kendisi kullanılamıyorsa bu fonksiyon doğal olarak kayıt
+    oluşturamaz; çağıranlar kullanıcı yanıtını bozmamak için hatayı yakalamalıdır.
+    """
+    session_id = get_or_create_session(user_id, username)
+    logged = log_chat(
+        session_id,
+        user_id,
+        username,
+        user_message,
+        bot_response,
+        channel=channel,
+        input_type=input_type,
+        outcome_hint=OUTCOME_TECHNICAL_ERROR,
+        error_stage=error_stage,
+        error_type=error_type,
+    )
+    touch_session(session_id, logged)
+    return {"session_id": session_id, **logged}
+
+
+def update_chat_outcome(
+    chat_log_id,
+    outcome,
+    *,
+    error_stage=None,
+    error_type=None,
+    only_if_outcomes=None,
+):
+    """Kanal teslimi/TTS sonradan hata verirse kaydedilmiş sonucu düzeltir."""
+    if not chat_log_id or outcome not in VALID_OUTCOMES:
+        return False
+
+    db = _get_db()
+    ref = db.collection(COL_CHAT_LOGS).document(chat_log_id)
+    snap = ref.get()
+    if not snap.exists:
+        return False
+    data = snap.to_dict() or {}
+    previous_outcome = data.get("outcome")
+    if only_if_outcomes and previous_outcome not in set(only_if_outcomes):
+        return False
+
+    updates = {
+        "outcome": outcome,
+        "outcome_confidence": 1.0,
+        "classification_reason.outcome": "explicit:channel_delivery_update",
+    }
+    if error_stage:
+        updates["error_stage"] = str(error_stage)[:120]
+    if error_type:
+        updates["error_type"] = str(error_type)[:200]
+    ref.update(updates)
+
+    session_id = data.get("session_id")
+    if session_id and previous_outcome and previous_outcome != outcome:
+        db.collection(COL_SESSIONS).document(session_id).update({
+            f"outcome_counts.{previous_outcome}": firestore.Increment(-1),
+            f"outcome_counts.{outcome}": firestore.Increment(1),
+            "last_outcome": outcome,
+        })
+    return True
 
 
 def save_voice_recording(
@@ -880,16 +1005,26 @@ def get_admin_overview(days=14):
     # Son N günün günlük mesaj hacmi
     since = _now() - timedelta(days=days)
     daily_counts = {}
+    intent_counts = {}
+    outcome_counts = {}
+    classified_messages = 0
     for doc in (
         db.collection(COL_CHAT_LOGS)
         .where(filter=FieldFilter("created_at", ">=", since))
-        .select(["created_at"])
+        .select(["created_at", "intent", "outcome"])
         .stream()
     ):
-        created = doc.to_dict().get("created_at")
+        row = doc.to_dict()
+        created = row.get("created_at")
         if isinstance(created, datetime):
             day = created.strftime("%Y-%m-%d")
             daily_counts[day] = daily_counts.get(day, 0) + 1
+        intent = row.get("intent")
+        outcome = row.get("outcome")
+        if intent and outcome:
+            classified_messages += 1
+            intent_counts[intent] = intent_counts.get(intent, 0) + 1
+            outcome_counts[outcome] = outcome_counts.get(outcome, 0) + 1
     daily_messages = [{"day": k, "c": v} for k, v in sorted(daily_counts.items())]
 
     # Değerlendirme dağılımı + ortalama
@@ -914,12 +1049,197 @@ def get_admin_overview(days=14):
         "avg_rating": avg_rating,
         "total_evaluations": len(eval_docs),
         "top_movies": top_movies,
+        "classified_messages": classified_messages,
+        "intent_distribution": [
+            {"intent": code, "count": count}
+            for code, count in sorted(
+                intent_counts.items(), key=lambda item: item[1], reverse=True
+            )
+        ],
+        "outcome_distribution": [
+            {"outcome": code, "count": count}
+            for code, count in sorted(
+                outcome_counts.items(), key=lambda item: item[1], reverse=True
+            )
+        ],
+        "success_rate": (
+            round(
+                outcome_counts.get("islem_basarili", 0)
+                * 100
+                / classified_messages,
+                2,
+            )
+            if classified_messages
+            else None
+        ),
+        "fallback_rate": (
+            round(
+                outcome_counts.get("anlasilamadi_fallback", 0)
+                * 100
+                / classified_messages,
+                2,
+            )
+            if classified_messages
+            else None
+        ),
+        "technical_error_rate": (
+            round(
+                outcome_counts.get("teknik_hata", 0)
+                * 100
+                / classified_messages,
+                2,
+            )
+            if classified_messages
+            else None
+        ),
     }
 
     _overview_cache["data"] = result
     _overview_cache["days"] = days
     _overview_cache["expires_at"] = now_ts + _OVERVIEW_CACHE_TTL_SECONDS
     return result
+
+
+def get_outcome_analytics_admin(
+    days=30,
+    limit=50,
+    *,
+    intent=None,
+    outcome=None,
+    channel=None,
+    scan_limit=5000,
+):
+    """Etiket dağılımları, çapraz tablo ve incelenebilir son turları döndürür."""
+    since = _now() - timedelta(days=days)
+    docs = list(
+        _get_db().collection(COL_CHAT_LOGS)
+        .where(filter=FieldFilter("created_at", ">=", since))
+        .order_by("created_at", direction=firestore.Query.DESCENDING)
+        .limit(scan_limit)
+        .stream()
+    )
+
+    rows = []
+    unclassified_count = 0
+    for doc in docs:
+        data = doc.to_dict() or {}
+        row_intent = data.get("intent")
+        row_outcome = data.get("outcome")
+        if not row_intent or not row_outcome:
+            unclassified_count += 1
+            continue
+        if intent and row_intent != intent:
+            continue
+        if outcome and row_outcome != outcome:
+            continue
+        if channel and data.get("channel") != channel:
+            continue
+        rows.append((doc.id, data))
+
+    intent_counts = {}
+    outcome_counts = {}
+    matrix = {}
+    daily = {}
+    for _doc_id, data in rows:
+        row_intent = data["intent"]
+        row_outcome = data["outcome"]
+        intent_counts[row_intent] = intent_counts.get(row_intent, 0) + 1
+        outcome_counts[row_outcome] = outcome_counts.get(row_outcome, 0) + 1
+        matrix_key = (row_intent, row_outcome)
+        matrix[matrix_key] = matrix.get(matrix_key, 0) + 1
+        created_at = data.get("created_at")
+        if isinstance(created_at, datetime):
+            day = created_at.strftime("%Y-%m-%d")
+            daily.setdefault(day, {})
+            daily[day][row_outcome] = daily[day].get(row_outcome, 0) + 1
+
+    total = len(rows)
+
+    def distribution(counts, key):
+        return [
+            {
+                key: code,
+                "count": count,
+                "percentage": round(count * 100 / total, 2) if total else 0,
+            }
+            for code, count in sorted(
+                counts.items(), key=lambda item: item[1], reverse=True
+            )
+        ]
+
+    recent_interactions = []
+    for doc_id, data in rows[:limit]:
+        recent_interactions.append({
+            "id": doc_id,
+            "session_id": data.get("session_id"),
+            "user_id": data.get("user_id"),
+            "username": data.get("username"),
+            "channel": data.get("channel"),
+            "input_type": data.get("input_type"),
+            "intent": data.get("intent"),
+            "outcome": data.get("outcome"),
+            "intent_confidence": data.get("intent_confidence"),
+            "outcome_confidence": data.get("outcome_confidence"),
+            "classification_version": data.get("classification_version"),
+            "classification_reason": data.get("classification_reason"),
+            "error_stage": data.get("error_stage"),
+            "error_type": data.get("error_type"),
+            "user_message": str(data.get("user_message") or "")[:500],
+            "bot_response": str(data.get("bot_response") or "")[:500],
+            "created_at": _iso(data.get("created_at")),
+        })
+
+    return {
+        "days": days,
+        "filters": {
+            "intent": intent,
+            "outcome": outcome,
+            "channel": channel,
+        },
+        "scan_limit": scan_limit,
+        "scanned_count": len(docs),
+        "scan_truncated": len(docs) == scan_limit,
+        "classified_count": total,
+        "unclassified_count": unclassified_count,
+        "intent_distribution": distribution(intent_counts, "intent"),
+        "outcome_distribution": distribution(outcome_counts, "outcome"),
+        "intent_outcome_matrix": [
+            {"intent": key[0], "outcome": key[1], "count": count}
+            for key, count in sorted(
+                matrix.items(), key=lambda item: item[1], reverse=True
+            )
+        ],
+        "daily_outcomes": [
+            {"day": day, "outcomes": outcomes}
+            for day, outcomes in sorted(daily.items())
+        ],
+        "rates": {
+            "success": (
+                round(outcome_counts.get("islem_basarili", 0) * 100 / total, 2)
+                if total
+                else None
+            ),
+            "fallback": (
+                round(
+                    outcome_counts.get("anlasilamadi_fallback", 0)
+                    * 100
+                    / total,
+                    2,
+                )
+                if total
+                else None
+            ),
+            "technical_error": (
+                round(
+                    outcome_counts.get("teknik_hata", 0) * 100 / total,
+                    2,
+                )
+                if total
+                else None
+            ),
+        },
+        "recent_interactions": recent_interactions,
+    }
 
 
 def get_sessions_admin(limit=50, offset=0, search=None):
@@ -956,6 +1276,10 @@ def get_sessions_admin(limit=50, offset=0, search=None):
             "summary": data.get("summary", ""),
             "avg_rating": round(rating_sum / rating_count, 2) if rating_count else None,
             "evaluation_count": rating_count,
+            "intent_counts": data.get("intent_counts", {}),
+            "outcome_counts": data.get("outcome_counts", {}),
+            "last_intent": data.get("last_intent"),
+            "last_outcome": data.get("last_outcome"),
         })
     return results
 
