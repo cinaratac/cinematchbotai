@@ -17,7 +17,7 @@ from ai_service import (
 from admin_api import admin_bp
 from database import (
     setup_database,
-    get_session_admin_detail,
+    session_exists,
     add_evaluation,
     get_or_create_session,
     log_chat,
@@ -679,7 +679,7 @@ def rate_session(session_id):
 
     note = str(data.get('note', ''))[:500]
 
-    if not get_session_admin_detail(session_id):
+    if not session_exists(session_id):
         return jsonify({"status": "error", "message": "Oturum bulunamadı."}), 404
 
     new_id = add_evaluation(session_id, rating, note=note, evaluator="user")

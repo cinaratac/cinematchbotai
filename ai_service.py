@@ -7,12 +7,11 @@ import json
 from urllib.parse import urlencode
 
 from database import (
-    get_or_create_session,
+    get_or_create_session_state,
     touch_session,
     log_chat,
     get_user_history,
-    update_session_summary,
-    get_session_transcript,
+    get_session_transcript_recent,
     get_user_facts,
     update_user_facts,
     log_tool_call,
@@ -477,8 +476,24 @@ def build_background_context(history):
 
 # PERİYODİK OLARAK ÇAĞRILAN ÖZETLEME ARACI
 
-def summarize_session(session_id):
-    transcript = get_session_transcript(session_id)
+def summarize_session(
+    session_id,
+    *,
+    previous_summary,
+    message_count,
+    summary_message_count,
+    new_turns=None,
+):
+    unsummarized_count = max(1, message_count - summary_message_count)
+    turn_limit = min(unsummarized_count, 50)
+    # Normal akışta son turlar prompt hazırlanırken zaten okunmuştur; aynı
+    # belgeleri özet için tekrar Firestore'dan çekme. Önceki bir özet başarısız
+    # olmuşsa ve bellekte yeterli tur yoksa güvenli sorgu fallback'i kullan.
+    candidate_turns = list(new_turns or [])
+    if len(candidate_turns) >= turn_limit:
+        transcript = candidate_turns[-turn_limit:]
+    else:
+        transcript = get_session_transcript_recent(session_id, turn_limit)
     if not transcript:
         return
 
@@ -491,21 +506,29 @@ def summarize_session(session_id):
         {
             "role": "system",
             "content": (
-                "Aşağıda bir sinema asistanı ile kullanıcı arasındaki konuşma dökümü var. "
-                "Bunu; kullanıcının hangi filmleri/türleri/yönetmenleri sorduğunu, hangi "
-                "önerilerin yapıldığını ve kullanıcının belli olan zevklerini içeren "
-                "3-5 cümlelik KISA bir özete çevir. Sadece özeti yaz, başka açıklama ekleme."
+                "Bir sinema asistanı oturumunun mevcut özeti ve bu özetten sonra "
+                "gelen yeni konuşma turları verilecek. Mevcut özeti yeni bilgilerle "
+                "güncelle. Kullanıcının sorduğu filmleri/türleri/yönetmenleri, yapılan "
+                "önerileri ve belli olan zevklerini koruyan 3-5 cümlelik KISA bir "
+                "özet yaz. Yalnızca güncel özeti döndür."
             ),
         },
-        {"role": "user", "content": transcript_text},
+        {
+            "role": "user",
+            "content": (
+                f"MEVCUT ÖZET:\n{previous_summary or '(henüz yok)'}\n\n"
+                f"YENİ KONUŞMA TURLARI:\n{transcript_text}"
+            ),
+        },
     ]
 
     try:
         response_data = _call_openrouter(messages)
         summary = response_data["choices"][0]["message"]["content"].strip()
-        update_session_summary(session_id, summary)
+        return summary or None
     except Exception as e:
         print(f"SİSTEM UYARISI: Oturum özeti çıkarılamadı: {e}")
+        return None
 
 
 
@@ -526,12 +549,19 @@ def get_ai_response(
     # 1. OTURUMU BUL / OLUŞTUR (session bazlı yapı)
     stateless = False
     try:
-        session_id = get_or_create_session(user_id, username)
+        session_state = get_or_create_session_state(user_id, username)
+        session_id = session_state["session_id"]
     except Exception as e:
         if not allow_stateless:
             raise
         stateless = True
         session_id = f"stateless-{user_id}"
+        session_state = {
+            "session_id": session_id,
+            "message_count": 0,
+            "summary": "",
+            "summary_message_count": 0,
+        }
         print(
             "SİSTEM UYARISI: Kalıcı hafıza kullanılamıyor; "
             f"bu istek stateless çalışacak: {e}"
@@ -577,14 +607,12 @@ def get_ai_response(
         except Exception as e:
             print(f"SİSTEM UYARISI: OMDb ön sorgusu başarısız: {e}")
 
-    # 2. BASİT BİLGİ ÇIKARIMI: mesajda isim gibi kesin bir bilgi varsa kalıcı profile hemen kaydet 
-    new_facts = extract_simple_facts(user_message)
-    if new_facts and not stateless:
-        update_user_facts(user_id, username, new_facts)
-
-    # 3. BOT CEVAP VERMEDEN ÖNCE KULLANICI GEÇMİŞİNİ ÇEK
-    
+    # 2. PROFİLİ İSTEK BAŞINA BİR KEZ OKU; yeni kesin bilgileri aynı bellek
+    # kopyasında birleştirip gerekiyorsa tek yazma ile kaydet.
     user_facts = {} if stateless else get_user_facts(user_id)
+    profile_updates = {}
+    if not stateless:
+        profile_updates.update(extract_simple_facts(user_message))
 
     # YENİ: Eğer bu kullanıcı için kayıtlı bir isim yoksa ve Cinematch
     # uygulamasından (Firebase Auth displayName) güvenilir bir ad geldiyse,
@@ -598,8 +626,15 @@ def get_ai_response(
         and username
         and username.strip().lower() not in _GENERIC_USERNAMES
     ):
-        user_facts["isim"] = username.strip()
-        update_user_facts(user_id, username, {"isim": username.strip()})
+        profile_updates.setdefault("isim", username.strip())
+
+    if profile_updates:
+        user_facts = update_user_facts(
+            user_id,
+            username,
+            profile_updates,
+            existing_facts=user_facts,
+        )
 
     profile_context = build_profile_context(user_facts)
 
@@ -615,7 +650,11 @@ def get_ai_response(
             "current_transcript": [],
         }
         if stateless
-        else get_user_history(user_id, session_id)
+        else get_user_history(
+            user_id,
+            session_id,
+            current_session_summary=session_state["summary"],
+        )
     )
     background_context = build_background_context(history)
 
@@ -861,12 +900,31 @@ sohbetin doğal devamıymış gibi bak, aynı cümleleri tekrar etme.
         )
         chat_log_id = logged["id"]
 
-        # 6. OTURUM SAYACINI GÜNCELLE
-        message_count = touch_session(session_id, classification)
-
-        # 7. BELİRLİ ARALIKLARLA ÖZETİ GÜNCELLEYEN ARACI TETİKLE
+        # 6. Özet gerekiyorsa mevcut session yazmasına dahil et. Böylece her
+        # dört turda ayrı bir Firestore summary update'i oluşmaz.
+        message_count = session_state["message_count"] + 1
+        summary_text = None
         if message_count % SUMMARY_UPDATE_INTERVAL == 0:
-            summarize_session(session_id)
+            summary_text = summarize_session(
+                session_id,
+                previous_summary=session_state["summary"],
+                message_count=message_count,
+                summary_message_count=session_state["summary_message_count"],
+                new_turns=[
+                    *history.get("current_transcript", []),
+                    {
+                        "user_message": user_message,
+                        "bot_response": final_answer,
+                    },
+                ],
+            )
+        message_count = touch_session(
+            session_id,
+            classification,
+            current_message_count=session_state["message_count"],
+            summary_text=summary_text,
+            summary_message_count=message_count if summary_text else None,
+        )
 
     if include_diagnostics:
         return final_answer, recommended_movies, session_id, {
@@ -900,17 +958,25 @@ def analyze_image(
     caption: kullanıcının fotoğrafla birlikte yazdığı yazı (yoksa None/boş olabilir)."""
 
 
-    session_id = get_or_create_session(user_id, username)
-
+    session_state = get_or_create_session_state(user_id, username)
+    session_id = session_state["session_id"]
+    user_facts = get_user_facts(user_id)
     if caption:
         new_facts = extract_simple_facts(caption)
         if new_facts:
-            update_user_facts(user_id, username, new_facts)
-
-    user_facts = get_user_facts(user_id)
+            user_facts = update_user_facts(
+                user_id,
+                username,
+                new_facts,
+                existing_facts=user_facts,
+            )
     profile_context = build_profile_context(user_facts)
 
-    history = get_user_history(user_id, session_id)
+    history = get_user_history(
+        user_id,
+        session_id,
+        current_session_summary=session_state["summary"],
+    )
     background_context = build_background_context(history)
 
     system_prompt = f"""Sen profesyonel bir sinema asistanı ve film eleştirmenisin. Sana bir FOTOĞRAF gönderildi.
@@ -1008,9 +1074,29 @@ KULLANICI GEÇMİŞİ (arka plan):
         error_type=error_type,
     )
 
-    message_count = touch_session(session_id, classification)
+    message_count = session_state["message_count"] + 1
+    summary_text = None
     if message_count % SUMMARY_UPDATE_INTERVAL == 0:
-        summarize_session(session_id)
+        summary_text = summarize_session(
+            session_id,
+            previous_summary=session_state["summary"],
+            message_count=message_count,
+            summary_message_count=session_state["summary_message_count"],
+            new_turns=[
+                *history.get("current_transcript", []),
+                {
+                    "user_message": log_message,
+                    "bot_response": final_answer,
+                },
+            ],
+        )
+    message_count = touch_session(
+        session_id,
+        classification,
+        current_message_count=session_state["message_count"],
+        summary_text=summary_text,
+        summary_message_count=message_count if summary_text else None,
+    )
 
     if include_diagnostics:
         return final_answer, session_id, {

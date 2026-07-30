@@ -15,6 +15,7 @@ from database import (
     get_performance_metrics_averages,
     get_recording_transcript,
     get_session_transcript,
+    get_voice_recording_for_qa,
     skip_voice_ai_evaluation,
     start_voice_ai_evaluation,
 )
@@ -564,7 +565,7 @@ def _validate_result(result):
     return result
 
 
-async def _transcribe_recording(recording_id, track="user"):
+async def _transcribe_recording(recording_id, track="user", recording=None):
     """Firebase'deki gerçek WAV kaydını (kullanıcı veya agent) bağımsız
     olarak yazıya çevir. track: 'user' veya 'agent'."""
     if track not in {"user", "agent"}:
@@ -575,6 +576,7 @@ async def _transcribe_recording(recording_id, track="user"):
         download_voice_recording_audio,
         recording_id,
         track,
+        recording=recording,
     )
     if not audio_bytes:
         raise RuntimeError(f"{track} ses kaydı boş.")
@@ -958,7 +960,17 @@ async def evaluate_voice_session(
                 recording_id,
             )
             return
-        audio_result = await _transcribe_recording(recording_id, "user")
+        recording = await asyncio.to_thread(
+            get_voice_recording_for_qa,
+            recording_id,
+        )
+        if not recording:
+            raise RuntimeError("Voice kaydı Firestore'da bulunamadı.")
+        audio_result = await _transcribe_recording(
+            recording_id,
+            "user",
+            recording,
+        )
         audio_transcript = audio_result["transcript"]
 
         agent_audio_transcript = ""
@@ -966,7 +978,9 @@ async def evaluate_voice_session(
         agent_audio_available = False
         try:
             agent_audio_result = await _transcribe_recording(
-                recording_id, "agent"
+                recording_id,
+                "agent",
+                recording,
             )
             agent_audio_transcript = agent_audio_result["transcript"]
             agent_audio_utterances = agent_audio_result["utterances"]

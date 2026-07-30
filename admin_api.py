@@ -186,7 +186,7 @@ def evaluate_session(session_id):
     note = str(payload.get("note", ""))[:1000]
     evaluator = str(payload.get("evaluator", ""))[:120]
 
-    if not db.get_session_admin_detail(session_id):
+    if not db.session_exists(session_id):
         return jsonify({"status": "error", "message": "Oturum bulunamadı."}), 404
 
     new_id = db.add_evaluation(session_id, rating, note=note, evaluator=evaluator)
@@ -210,18 +210,22 @@ def performance_metrics():
     limit, offset = _pagination_params()
     session_id = request.args.get("session_id") or None
 
-    metrics = db.get_performance_metrics_admin(
-        limit=limit, offset=offset, session_id=session_id
+    bundle = db.get_performance_metrics_bundle(
+        limit=limit,
+        offset=offset,
+        session_id=session_id,
     )
-    total = db.count_performance_metrics_admin(session_id=session_id)
-    averages = db.get_performance_metrics_averages(session_id=session_id)
 
     return jsonify({
         "status": "success",
-        "data": metrics,
-        "averages": averages,
+        "data": bundle["data"],
+        "averages": bundle["averages"],
         "session_id": session_id,
-        "pagination": {"limit": limit, "offset": offset, "total": total},
+        "pagination": {
+            "limit": limit,
+            "offset": offset,
+            "total": bundle["total"],
+        },
     }), 200
 
 

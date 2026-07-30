@@ -1,10 +1,13 @@
 import os
 import json
 import time
+import threading
+import random
 from datetime import datetime, timedelta, timezone
 
 import firebase_admin
 from firebase_admin import credentials, firestore, storage
+from google.api_core.exceptions import FailedPrecondition
 from google.cloud.firestore_v1 import FieldFilter
 from outcome_service import (
     OUTCOME_TECHNICAL_ERROR,
@@ -66,6 +69,19 @@ COL_VOICE_RECORDINGS = "bot_voice_recordings"
 COL_VOICE_AI_EVALUATIONS = "bot_voice_ai_evaluations"
 
 
+_MISSING = object()
+_history_cache_lock = threading.Lock()
+_past_summary_cache = {}
+_HISTORY_CACHE_TTL_SECONDS = max(
+    0,
+    int(os.environ.get("FIRESTORE_HISTORY_CACHE_TTL_SECONDS", "120")),
+)
+_HISTORY_CACHE_MAX_USERS = max(
+    1,
+    int(os.environ.get("FIRESTORE_HISTORY_CACHE_MAX_USERS", "1000")),
+)
+
+
 def _now():
     return datetime.now(timezone.utc)
 
@@ -96,7 +112,48 @@ def setup_database():
 # OTURUM YÖNETİMİ
 # ============================================================
 
-def get_or_create_session(user_id, username):
+def _invalidate_past_summary_cache(user_id):
+    with _history_cache_lock:
+        _past_summary_cache.pop(str(user_id), None)
+
+
+def _session_state(doc, data):
+    message_count = data.get("message_count", 0)
+    if not isinstance(message_count, int) or isinstance(message_count, bool):
+        message_count = 0
+
+    summary = data.get("summary", "") or ""
+    summary_message_count = data.get("summary_message_count")
+    if (
+        not isinstance(summary_message_count, int)
+        or isinstance(summary_message_count, bool)
+        or summary_message_count < 0
+        or summary_message_count > message_count
+    ):
+        # Eski oturumlarda bu alan bulunmaz. Son özet denemesinin başarısız
+        # olmuş olma ihtimaline karşı bir önceki aralık sınırından başlarız.
+        # Birkaç turu bir kez daha özetlemek, yeni turları atlamaktan güvenlidir.
+        summary_message_count = (
+            max(
+                0,
+                (
+                    (message_count // SUMMARY_UPDATE_INTERVAL) - 1
+                ) * SUMMARY_UPDATE_INTERVAL,
+            )
+            if summary
+            else 0
+        )
+
+    return {
+        "session_id": doc.id,
+        "message_count": message_count,
+        "summary": summary,
+        "summary_message_count": summary_message_count,
+    }
+
+
+def get_or_create_session_state(user_id, username):
+    """Aktif oturumu ve zaten okunan özet/sayaç durumunu birlikte döndürür."""
     db = _get_db()
     user_id = str(user_id)
 
@@ -115,7 +172,7 @@ def get_or_create_session(user_id, username):
         last_active = data["last_active_at"]
         if isinstance(last_active, datetime):
             if _now() - last_active <= timedelta(minutes=SESSION_TIMEOUT_MINUTES):
-                return doc.id
+                return _session_state(doc, data)
         # Süresi dolmuş -> pasif işaretle
         doc.reference.update({"is_active": False})
 
@@ -127,6 +184,7 @@ def get_or_create_session(user_id, username):
         "last_active_at": _now(),
         "message_count": 0,
         "summary": "",
+        "summary_message_count": 0,
         "is_active": True,
         "rating_sum": 0,
         "rating_count": 0,
@@ -135,11 +193,29 @@ def get_or_create_session(user_id, username):
         "last_intent": None,
         "last_outcome": None,
     })
+    _invalidate_past_summary_cache(user_id)
     print(f"SİSTEM: Kullanıcı {user_id} için yeni oturum açıldı -> session_id={new_doc.id}")
-    return new_doc.id
+    return {
+        "session_id": new_doc.id,
+        "message_count": 0,
+        "summary": "",
+        "summary_message_count": 0,
+    }
 
 
-def touch_session(session_id, classification=None):
+def get_or_create_session(user_id, username):
+    """Geriye uyumlu oturum-ID arayüzü."""
+    return get_or_create_session_state(user_id, username)["session_id"]
+
+
+def touch_session(
+    session_id,
+    classification=None,
+    *,
+    current_message_count=None,
+    summary_text=None,
+    summary_message_count=None,
+):
     db = _get_db()
     ref = db.collection(COL_SESSIONS).document(session_id)
     updates = {
@@ -155,15 +231,27 @@ def touch_session(session_id, classification=None):
         if outcome:
             updates[f"outcome_counts.{outcome}"] = firestore.Increment(1)
             updates["last_outcome"] = outcome
+    if summary_text:
+        updates["summary"] = summary_text
+        if (
+            isinstance(summary_message_count, int)
+            and summary_message_count >= 0
+        ):
+            updates["summary_message_count"] = summary_message_count
     ref.update(updates)
-    snap = ref.get()
-    data = snap.to_dict() or {}
-    return data.get("message_count", 0)
+    if isinstance(current_message_count, int) and not isinstance(
+        current_message_count, bool
+    ):
+        return current_message_count + 1
+    return None
 
 
-def update_session_summary(session_id, summary_text):
+def update_session_summary(session_id, summary_text, message_count=None):
     db = _get_db()
-    db.collection(COL_SESSIONS).document(session_id).update({"summary": summary_text})
+    updates = {"summary": summary_text}
+    if isinstance(message_count, int) and message_count >= 0:
+        updates["summary_message_count"] = message_count
+    db.collection(COL_SESSIONS).document(session_id).update(updates)
     print(f"SİSTEM: Oturum #{session_id} özeti güncellendi.")
 
 
@@ -334,9 +422,6 @@ def save_voice_recording(
         "error": None,
         "created_at": _now(),
     }
-    # Önce metadata yazılır. Storage yüklemesi hata verirse koleksiyon yine
-    # görünür ve admin/log üzerinden gerçek sebep teşhis edilebilir.
-    doc_ref.set(payload)
     try:
         bucket = storage.bucket(bucket_name)
         bucket.blob(user_storage_path).upload_from_filename(
@@ -347,17 +432,49 @@ def save_voice_recording(
             agent_audio_path,
             content_type="audio/wav",
         )
-        doc_ref.update({
+        payload.update({
             "status": "ready",
             "uploaded_at": _now(),
         })
+        # Başarılı kayıt için uploading + ready şeklinde iki ayrı Firestore
+        # yazması yerine nihai metadata tek seferde oluşturulur.
+        doc_ref.set(payload)
     except Exception as exc:
-        doc_ref.update({
+        payload.update({
             "status": "failed",
             "error": str(exc)[:1000],
         })
+        # Hata görünürlüğü korunur; başarısız deneme de tek metadata yazmasıdır.
+        doc_ref.set(payload)
         raise
     return recording_id
+
+
+def _stream_ordered_with_fallback(
+    ordered_query,
+    fallback_query,
+    *,
+    sort_field,
+    reverse,
+    limit=None,
+):
+    """Birleşik index hazır değilse görünürlüğü koruyan geçici geri dönüş."""
+    try:
+        return list(ordered_query.stream())
+    except FailedPrecondition:
+        docs = list(fallback_query.stream())
+        docs.sort(
+            key=lambda doc: (
+                (doc.to_dict() or {}).get(sort_field).timestamp()
+                if isinstance(
+                    (doc.to_dict() or {}).get(sort_field),
+                    datetime,
+                )
+                else 0
+            ),
+            reverse=reverse,
+        )
+        return docs[:limit] if limit is not None else docs
 
 
 def get_voice_recordings_admin(session_id):
@@ -366,18 +483,20 @@ def get_voice_recordings_admin(session_id):
     if not bucket_name:
         return []
 
-    docs = list(
+    query = (
         _get_db().collection(COL_VOICE_RECORDINGS)
         .where(filter=FieldFilter("session_id", "==", session_id))
-        .stream()
     )
-    docs.sort(
-        key=lambda d: (
-            d.to_dict().get("created_at").timestamp()
-            if isinstance(d.to_dict().get("created_at"), datetime)
-            else 0
-        )
+    docs = _stream_ordered_with_fallback(
+        query.order_by(
+            "created_at",
+            direction=firestore.Query.DESCENDING,
+        ),
+        query,
+        sort_field="created_at",
+        reverse=True,
     )
+    docs.reverse()
     bucket = storage.bucket(bucket_name)
     result = []
     for doc in docs:
@@ -411,18 +530,18 @@ def list_voice_recordings_api(limit=50, offset=0, session_id=None):
     """Dış entegrasyon API'si için kayıt metadata listesini döndürür."""
     collection = _get_db().collection(COL_VOICE_RECORDINGS)
     if session_id:
-        docs = list(
-            collection
-            .where(filter=FieldFilter("session_id", "==", session_id))
-            .stream()
+        query = collection.where(
+            filter=FieldFilter("session_id", "==", session_id)
         )
-        docs.sort(
-            key=lambda d: (
-                d.to_dict().get("created_at").timestamp()
-                if isinstance(d.to_dict().get("created_at"), datetime)
-                else 0
-            ),
+        docs = _stream_ordered_with_fallback(
+            query.order_by(
+                "created_at",
+                direction=firestore.Query.DESCENDING,
+            ).limit(limit + offset),
+            query,
+            sort_field="created_at",
             reverse=True,
+            limit=limit + offset,
         )
     else:
         docs = list(
@@ -488,19 +607,20 @@ def get_voice_recording_download_url(recording_id, track):
     )
 
 
-def download_voice_recording_audio(recording_id, track="user"):
+def download_voice_recording_audio(
+    recording_id,
+    track="user",
+    *,
+    recording=None,
+):
     """QA işleyicisi için private Firebase Storage kaydını byte olarak döndürür."""
     if track not in {"user", "agent"}:
         raise ValueError("track user veya agent olmalıdır.")
-    doc = (
-        _get_db()
-        .collection(COL_VOICE_RECORDINGS)
-        .document(recording_id)
-        .get()
-    )
-    if not doc.exists:
+    if recording is None:
+        recording = get_voice_recording_for_qa(recording_id)
+    if not recording:
         raise RuntimeError("Voice kaydı Firestore'da bulunamadı.")
-    storage_path = (doc.to_dict() or {}).get(f"{track}_storage_path")
+    storage_path = recording.get(f"{track}_storage_path")
     bucket_name = _storage_bucket_name()
     if not storage_path or not bucket_name:
         raise RuntimeError("Voice kaydının Storage yolu bulunamadı.")
@@ -615,11 +735,21 @@ def cleanup_stale_voice_ai_evaluations(max_age_minutes=30):
     cutoff = _now() - timedelta(minutes=max_age_minutes)
     docs = []
     for status in ("queued", "processing"):
-        docs.extend(
+        base_query = (
             _get_db().collection(COL_VOICE_AI_EVALUATIONS)
             .where(filter=FieldFilter("status", "==", status))
-            .stream()
         )
+        stale_query = (
+            base_query
+            .where(filter=FieldFilter("updated_at", "<", cutoff))
+            .order_by("updated_at", direction=firestore.Query.ASCENDING)
+            .limit(500)
+        )
+        try:
+            docs.extend(stale_query.stream())
+        except FailedPrecondition:
+            # Index deploy edilene kadar eski sorguyla işlevi koru.
+            docs.extend(base_query.stream())
     cleaned = 0
     for doc in docs:
         data = doc.to_dict() or {}
@@ -637,17 +767,17 @@ def cleanup_stale_voice_ai_evaluations(max_age_minutes=30):
 
 
 def get_voice_ai_evaluations_admin(session_id):
-    docs = list(
+    query = (
         _get_db().collection(COL_VOICE_AI_EVALUATIONS)
         .where(filter=FieldFilter("session_id", "==", session_id))
-        .stream()
     )
-    docs.sort(
-        key=lambda d: (
-            d.to_dict().get("created_at").timestamp()
-            if isinstance(d.to_dict().get("created_at"), datetime)
-            else 0
+    docs = _stream_ordered_with_fallback(
+        query.order_by(
+            "created_at",
+            direction=firestore.Query.DESCENDING,
         ),
+        query,
+        sort_field="created_at",
         reverse=True,
     )
     rows = []
@@ -662,10 +792,23 @@ def get_voice_ai_evaluations_admin(session_id):
 def get_voice_qa_trend(days=14, session_id=None, limit=500):
     """Dashboard için QA skor, kriter, eşleşme ve barge-in trendini üretir."""
     cutoff = _now() - timedelta(days=days)
-    query = _get_db().collection(COL_VOICE_AI_EVALUATIONS).where(
-        filter=FieldFilter("status", "==", "completed")
+    base_query = _get_db().collection(COL_VOICE_AI_EVALUATIONS).where(
+        filter=FieldFilter("status", "==", "completed"),
     )
-    docs = list(query.limit(limit).stream())
+    if session_id:
+        base_query = base_query.where(
+            filter=FieldFilter("session_id", "==", session_id)
+        )
+    query = (
+        base_query
+        .where(filter=FieldFilter("created_at", ">=", cutoff))
+        .order_by("created_at", direction=firestore.Query.DESCENDING)
+        .limit(limit)
+    )
+    try:
+        docs = list(query.stream())
+    except FailedPrecondition:
+        docs = list(base_query.limit(limit).stream())
     rows = []
     criterion_sums = {}
     criterion_counts = {}
@@ -673,8 +816,6 @@ def get_voice_qa_trend(days=14, session_id=None, limit=500):
         data = doc.to_dict() or {}
         created_at = data.get("created_at")
         if not isinstance(created_at, datetime) or created_at < cutoff:
-            continue
-        if session_id and data.get("session_id") != session_id:
             continue
         criteria = data.get("criteria") or {}
         for key, item in criteria.items():
@@ -705,6 +846,7 @@ def get_voice_qa_trend(days=14, session_id=None, limit=500):
     metrics = _get_performance_metric_docs(
         session_id=session_id,
         scan_limit=2000,
+        since=cutoff,
     )
     barge_in_latencies = []
     for metric_doc in metrics:
@@ -757,19 +899,21 @@ def get_voice_qa_trend(days=14, session_id=None, limit=500):
 
 def get_recording_transcript(recording_id, limit=100):
     """Yalnızca tek bir voice WAV kaydı sırasında oluşan konuşma turları."""
-    docs = list(
+    query = (
         _get_db().collection(COL_CHAT_LOGS)
         .where(filter=FieldFilter("recording_id", "==", recording_id))
-        .limit(limit)
-        .stream()
     )
-    docs.sort(
-        key=lambda d: (
-            d.to_dict().get("created_at").timestamp()
-            if isinstance(d.to_dict().get("created_at"), datetime)
-            else 0
-        )
+    docs = _stream_ordered_with_fallback(
+        query.order_by(
+            "created_at",
+            direction=firestore.Query.DESCENDING,
+        ).limit(limit),
+        query,
+        sort_field="created_at",
+        reverse=True,
+        limit=limit,
     )
+    docs.reverse()
     return [{"id": doc.id, **doc.to_dict()} for doc in docs]
 
 
@@ -808,30 +952,74 @@ def get_session_summary(session_id):
 # KULLANICI GEÇMİŞİ
 # ============================================================
 
-def get_user_history(user_id, current_session_id, max_past_sessions=3):
-    db = _get_db()
-    query = (
-        db.collection(COL_SESSIONS)
-        .where(filter=FieldFilter("user_id", "==", str(user_id)))
-        .order_by("started_at", direction=firestore.Query.DESCENDING)
-        .limit(max_past_sessions + 1)  # +1: mevcut oturumu eleyebilmek için
-    )
-    past_sessions = []
-    for doc in query.stream():
-        if doc.id == current_session_id:
-            continue
-        data = doc.to_dict()
-        if not data.get("summary"):
-            continue
-        past_sessions.append({
-            "session_id": doc.id,
-            "started_at": data.get("started_at"),
-            "summary": data.get("summary"),
-        })
-        if len(past_sessions) >= max_past_sessions:
-            break
+def _get_cached_past_summaries(user_id):
+    if _HISTORY_CACHE_TTL_SECONDS <= 0:
+        return None
+    cache_key = str(user_id)
+    now_ts = time.monotonic()
+    with _history_cache_lock:
+        cached = _past_summary_cache.get(cache_key)
+        if not cached:
+            return None
+        if cached["expires_at"] <= now_ts:
+            _past_summary_cache.pop(cache_key, None)
+            return None
+        return [dict(row) for row in cached["rows"]]
 
-    current_session_summary = get_session_summary(current_session_id)
+
+def _cache_past_summaries(user_id, rows):
+    if _HISTORY_CACHE_TTL_SECONDS <= 0:
+        return
+    cache_key = str(user_id)
+    with _history_cache_lock:
+        if (
+            cache_key not in _past_summary_cache
+            and len(_past_summary_cache) >= _HISTORY_CACHE_MAX_USERS
+        ):
+            oldest_key = next(iter(_past_summary_cache))
+            _past_summary_cache.pop(oldest_key, None)
+        _past_summary_cache[cache_key] = {
+            "expires_at": time.monotonic() + _HISTORY_CACHE_TTL_SECONDS,
+            "rows": [dict(row) for row in rows],
+        }
+
+
+def get_user_history(
+    user_id,
+    current_session_id,
+    max_past_sessions=3,
+    *,
+    current_session_summary=_MISSING,
+):
+    db = _get_db()
+    past_sessions = _get_cached_past_summaries(user_id)
+    if past_sessions is None:
+        query = (
+            db.collection(COL_SESSIONS)
+            .where(filter=FieldFilter("user_id", "==", str(user_id)))
+            .order_by("started_at", direction=firestore.Query.DESCENDING)
+            .limit(max_past_sessions + 1)  # mevcut oturumu eleyebilmek için
+        )
+        past_sessions = []
+        for doc in query.stream():
+            if doc.id == current_session_id:
+                continue
+            data = doc.to_dict()
+            if not data.get("summary"):
+                continue
+            past_sessions.append({
+                "session_id": doc.id,
+                "started_at": data.get("started_at"),
+                "summary": data.get("summary"),
+            })
+            if len(past_sessions) >= max_past_sessions:
+                break
+        _cache_past_summaries(user_id, past_sessions)
+    else:
+        past_sessions = past_sessions[:max_past_sessions]
+
+    if current_session_summary is _MISSING:
+        current_session_summary = get_session_summary(current_session_id)
     current_transcript = get_session_transcript_recent(current_session_id, RECENT_TURNS_IN_PROMPT)
 
     return {
@@ -881,6 +1069,33 @@ def log_performance_metric(metric):
     eklenir. Mesaj/transkript/ses içeriği bu koleksiyona yazılmamalıdır.
     """
     payload = dict(metric)
+    try:
+        configured_sample_rate = float(os.environ.get(
+            "PERFORMANCE_METRIC_SUCCESS_SAMPLE_RATE",
+            "0.25",
+        ))
+    except (TypeError, ValueError):
+        configured_sample_rate = 0.25
+    sample_rate = min(
+        1.0,
+        max(0.0, configured_sample_rate),
+    )
+    input_type = str(payload.get("input_type") or "")
+    preserve_every_sample = (
+        payload.get("channel") == "voice_websocket"
+        or bool(payload.get("recording_id"))
+        or input_type in {"voice", "audio", "streaming_audio"}
+    )
+    if (
+        payload.get("status") == "success"
+        and not preserve_every_sample
+        and sample_rate < 1.0
+        and random.random() >= sample_rate
+    ):
+        return None
+    payload["success_sample_rate"] = (
+        1.0 if preserve_every_sample else sample_rate
+    )
     ai_ms = payload.get("ai_ms")
     ttfb_ms = payload.get("ttfb_ms")
     ttfs_ms = payload.get("ttfs_ms")
@@ -914,10 +1129,14 @@ def get_user_facts(user_id):
     return data.get("facts", {}) or {}
 
 
-def update_user_facts(user_id, username, new_facts):
+def update_user_facts(user_id, username, new_facts, *, existing_facts=None):
     if not new_facts:
-        return
-    existing = get_user_facts(user_id)
+        return dict(existing_facts or {})
+    existing = (
+        dict(existing_facts)
+        if existing_facts is not None
+        else get_user_facts(user_id)
+    )
     existing.update(new_facts)
 
     db = _get_db()
@@ -927,6 +1146,7 @@ def update_user_facts(user_id, username, new_facts):
         "updated_at": _now(),
     }, merge=True)
     print(f"SİSTEM: Kullanıcı {user_id} profili güncellendi -> {existing}")
+    return existing
 
 
 # ============================================================
@@ -937,7 +1157,110 @@ def update_user_facts(user_id, username, new_facts):
 # tüm chat_logs'unu tarıyor). Panel her açıldığında/yenilendiğinde tekrar
 # tekrar çalışmasın diye kısa süreli bellek-içi cache kullanılıyor.
 _overview_cache = {"data": None, "expires_at": 0, "days": None}
-_OVERVIEW_CACHE_TTL_SECONDS = 60
+_OVERVIEW_CACHE_TTL_SECONDS = max(
+    0,
+    int(os.environ.get("FIRESTORE_OVERVIEW_CACHE_TTL_SECONDS", "60")),
+)
+_outcome_cache_lock = threading.Lock()
+_outcome_cache = {}
+_OUTCOME_CACHE_TTL_SECONDS = max(
+    0,
+    int(os.environ.get("FIRESTORE_OUTCOME_CACHE_TTL_SECONDS", "120")),
+)
+_SESSION_SEARCH_CACHE_TTL_SECONDS = max(
+    0,
+    int(os.environ.get("FIRESTORE_SESSION_SEARCH_CACHE_TTL_SECONDS", "60")),
+)
+_session_search_cache_lock = threading.Lock()
+_session_search_cache = {"rows": None, "expires_at": 0}
+_unique_user_cache_lock = threading.Lock()
+_unique_user_cache = {"count": None, "expires_at": 0}
+_UNIQUE_USER_CACHE_TTL_SECONDS = max(
+    0,
+    int(os.environ.get("FIRESTORE_UNIQUE_USER_CACHE_TTL_SECONDS", "300")),
+)
+_pagination_cache_lock = threading.Lock()
+_pagination_cursor_cache = {}
+_PAGINATION_CURSOR_TTL_SECONDS = max(
+    0,
+    int(os.environ.get("FIRESTORE_CURSOR_CACHE_TTL_SECONDS", "300")),
+)
+_performance_cache_lock = threading.Lock()
+_performance_docs_cache = {}
+_PERFORMANCE_CACHE_TTL_SECONDS = max(
+    0,
+    int(os.environ.get("FIRESTORE_PERFORMANCE_CACHE_TTL_SECONDS", "60")),
+)
+
+
+def _query_page_with_cursor(query, *, cache_key, limit, offset):
+    """Sıralı admin sorgularında ardışık sayfaları start_after ile getirir."""
+    now_ts = time.monotonic()
+    cursor = None
+    if offset > 0 and _PAGINATION_CURSOR_TTL_SECONDS > 0:
+        with _pagination_cache_lock:
+            cached = _pagination_cursor_cache.get(
+                (cache_key, limit, offset)
+            )
+            if cached and cached["expires_at"] > now_ts:
+                cursor = cached["snapshot"]
+
+    if cursor is not None:
+        docs = list(query.start_after(cursor).limit(limit).stream())
+    else:
+        fetched = list(query.limit(limit + offset).stream())
+        docs = fetched[offset:offset + limit]
+        # Doğrudan ileri bir sayfaya gelinmişse aradaki cursor'ları da sakla.
+        if _PAGINATION_CURSOR_TTL_SECONDS > 0:
+            with _pagination_cache_lock:
+                for boundary in range(limit, len(fetched) + 1, limit):
+                    _pagination_cursor_cache[(
+                        cache_key,
+                        limit,
+                        boundary,
+                    )] = {
+                        "snapshot": fetched[boundary - 1],
+                        "expires_at": (
+                            now_ts + _PAGINATION_CURSOR_TTL_SECONDS
+                        ),
+                    }
+
+    if docs and _PAGINATION_CURSOR_TTL_SECONDS > 0:
+        next_offset = offset + len(docs)
+        with _pagination_cache_lock:
+            if len(_pagination_cursor_cache) >= 256:
+                oldest_key = next(iter(_pagination_cursor_cache))
+                _pagination_cursor_cache.pop(oldest_key, None)
+            _pagination_cursor_cache[(cache_key, limit, next_offset)] = {
+                "snapshot": docs[-1],
+                "expires_at": now_ts + _PAGINATION_CURSOR_TTL_SECONDS,
+            }
+    return docs
+
+
+def _count_unique_users(db):
+    now_ts = time.monotonic()
+    if _UNIQUE_USER_CACHE_TTL_SECONDS > 0:
+        with _unique_user_cache_lock:
+            if (
+                _unique_user_cache["count"] is not None
+                and _unique_user_cache["expires_at"] > now_ts
+            ):
+                return _unique_user_cache["count"]
+
+    user_ids = set()
+    for doc in db.collection(COL_SESSIONS).select(["user_id"]).stream():
+        user_id = (doc.to_dict() or {}).get("user_id")
+        if user_id is not None:
+            user_ids.add(user_id)
+    count = len(user_ids)
+    if _UNIQUE_USER_CACHE_TTL_SECONDS > 0:
+        with _unique_user_cache_lock:
+            _unique_user_cache["count"] = count
+            _unique_user_cache["expires_at"] = (
+                now_ts + _UNIQUE_USER_CACHE_TTL_SECONDS
+            )
+    return count
 
 
 def get_admin_overview(days=14):
@@ -960,11 +1283,9 @@ def get_admin_overview(days=14):
     total_messages = db.collection(COL_CHAT_LOGS).count().get()[0][0].value
     total_tool_calls = db.collection(COL_API_LOGS).count().get()[0][0].value
 
-    # Benzersiz kullanıcı sayısı (küçük ölçek için Python tarafında hesaplanıyor)
-    user_ids = set()
-    for doc in db.collection(COL_SESSIONS).select(["user_id"]).stream():
-        user_ids.add(doc.to_dict().get("user_id"))
-    total_users = len(user_ids)
+    # Firestore distinct-count sunmadığı için ilk hesaplamada session belgeleri
+    # okunur; sonuç ayrıca cache'lenerek her overview yenilemesinde tarama önlenir.
+    total_users = _count_unique_users(db)
 
     # Tool başarı oranı + en çok sorulan filmler: son 500 tool çağrısı üzerinden
     tool_docs = list(
@@ -973,7 +1294,7 @@ def get_admin_overview(days=14):
         .limit(500)
         .stream()
     )
-    successful_tool_calls = 0
+    sampled_successful_tool_calls = 0
     movie_counts = {}
     movie_duration_sums = {}
     movie_duration_counts = {}
@@ -981,7 +1302,7 @@ def get_admin_overview(days=14):
         data = d.to_dict()
         resp = data.get("api_response", "") or ""
         if '"Response": "True"' in resp or '"Response":"True"' in resp:
-            successful_tool_calls += 1
+            sampled_successful_tool_calls += 1
         name = data.get("movie_name")
         if name:
             movie_counts[name] = movie_counts.get(name, 0) + 1
@@ -1001,6 +1322,11 @@ def get_admin_overview(days=14):
         }
         for k, v in sorted(movie_counts.items(), key=lambda x: x[1], reverse=True)[:5]
     ]
+    if tool_docs:
+        sampled_success_rate = sampled_successful_tool_calls / len(tool_docs)
+        successful_tool_calls = round(total_tool_calls * sampled_success_rate)
+    else:
+        successful_tool_calls = 0
 
     # Son N günün günlük mesaj hacmi
     since = _now() - timedelta(days=days)
@@ -1027,14 +1353,27 @@ def get_admin_overview(days=14):
             outcome_counts[outcome] = outcome_counts.get(outcome, 0) + 1
     daily_messages = [{"day": k, "c": v} for k, v in sorted(daily_counts.items())]
 
-    # Değerlendirme dağılımı + ortalama
-    eval_docs = [d.to_dict() for d in db.collection(COL_EVALUATIONS).stream()]
-    ratings = [e.get("rating") for e in eval_docs if e.get("rating") is not None]
+    # Tam değerlendirme belgelerini indirmek yerine beş küçük index
+    # aggregation sorgusuyla aynı dağılımı hesapla.
     rating_dist = {}
-    for r in ratings:
-        rating_dist[r] = rating_dist.get(r, 0) + 1
+    for rating in range(1, 6):
+        count = (
+            db.collection(COL_EVALUATIONS)
+            .where(filter=FieldFilter("rating", "==", rating))
+            .count()
+            .get()[0][0]
+            .value
+        )
+        if count:
+            rating_dist[rating] = count
+    total_evaluations = sum(rating_dist.values())
+    rating_sum = sum(rating * count for rating, count in rating_dist.items())
     rating_distribution = [{"rating": k, "c": v} for k, v in sorted(rating_dist.items())]
-    avg_rating = round(sum(ratings) / len(ratings), 2) if ratings else None
+    avg_rating = (
+        round(rating_sum / total_evaluations, 2)
+        if total_evaluations
+        else None
+    )
 
     result = {
         "total_sessions": total_sessions,
@@ -1043,11 +1382,13 @@ def get_admin_overview(days=14):
         "total_users": total_users,
         "total_tool_calls": total_tool_calls,
         "successful_tool_calls": successful_tool_calls,
-        "failed_tool_calls": total_tool_calls - successful_tool_calls,
+        "failed_tool_calls": max(0, total_tool_calls - successful_tool_calls),
+        "tool_call_sample_size": len(tool_docs),
+        "sampled_successful_tool_calls": sampled_successful_tool_calls,
         "daily_messages": daily_messages,
         "rating_distribution": rating_distribution,
         "avg_rating": avg_rating,
-        "total_evaluations": len(eval_docs),
+        "total_evaluations": total_evaluations,
         "top_movies": top_movies,
         "classified_messages": classified_messages,
         "intent_distribution": [
@@ -1110,6 +1451,21 @@ def get_outcome_analytics_admin(
     scan_limit=5000,
 ):
     """Etiket dağılımları, çapraz tablo ve incelenebilir son turları döndürür."""
+    cache_key = (
+        days,
+        limit,
+        intent,
+        outcome,
+        channel,
+        scan_limit,
+    )
+    now_ts = time.monotonic()
+    if _OUTCOME_CACHE_TTL_SECONDS > 0:
+        with _outcome_cache_lock:
+            cached = _outcome_cache.get(cache_key)
+            if cached and cached["expires_at"] > now_ts:
+                return cached["data"]
+
     since = _now() - timedelta(days=days)
     docs = list(
         _get_db().collection(COL_CHAT_LOGS)
@@ -1189,7 +1545,7 @@ def get_outcome_analytics_admin(
             "created_at": _iso(data.get("created_at")),
         })
 
-    return {
+    result = {
         "days": days,
         "filters": {
             "intent": intent,
@@ -1240,62 +1596,110 @@ def get_outcome_analytics_admin(
         },
         "recent_interactions": recent_interactions,
     }
+    if _OUTCOME_CACHE_TTL_SECONDS > 0:
+        with _outcome_cache_lock:
+            if len(_outcome_cache) >= 32 and cache_key not in _outcome_cache:
+                oldest_key = next(iter(_outcome_cache))
+                _outcome_cache.pop(oldest_key, None)
+            _outcome_cache[cache_key] = {
+                "expires_at": now_ts + _OUTCOME_CACHE_TTL_SECONDS,
+                "data": result,
+            }
+    return result
+
+
+def _format_session_admin_row(doc_id, data):
+    # Ortalama puan session belgesinde denormalize tutulduğu için burada
+    # oturum başına evaluations sorgusu gerekmez.
+    rating_sum = data.get("rating_sum", 0) or 0
+    rating_count = data.get("rating_count", 0) or 0
+    return {
+        "session_id": doc_id,
+        "user_id": data.get("user_id"),
+        "username": data.get("username"),
+        "started_at": _iso(data.get("started_at")),
+        "last_active_at": _iso(data.get("last_active_at")),
+        "message_count": data.get("message_count", 0),
+        "is_active": data.get("is_active", False),
+        "summary": data.get("summary", ""),
+        "avg_rating": round(rating_sum / rating_count, 2) if rating_count else None,
+        "evaluation_count": rating_count,
+        "intent_counts": data.get("intent_counts", {}),
+        "outcome_counts": data.get("outcome_counts", {}),
+        "last_intent": data.get("last_intent"),
+        "last_outcome": data.get("last_outcome"),
+    }
+
+
+def _get_session_search_rows():
+    now_ts = time.monotonic()
+    if _SESSION_SEARCH_CACHE_TTL_SECONDS > 0:
+        with _session_search_cache_lock:
+            if (
+                _session_search_cache["rows"] is not None
+                and _session_search_cache["expires_at"] > now_ts
+            ):
+                return _session_search_cache["rows"]
+
+    docs = (
+        _get_db().collection(COL_SESSIONS)
+        .order_by("last_active_at", direction=firestore.Query.DESCENDING)
+        .stream()
+    )
+    rows = [(doc.id, doc.to_dict() or {}) for doc in docs]
+    if _SESSION_SEARCH_CACHE_TTL_SECONDS > 0:
+        with _session_search_cache_lock:
+            _session_search_cache["rows"] = rows
+            _session_search_cache["expires_at"] = (
+                now_ts + _SESSION_SEARCH_CACHE_TTL_SECONDS
+            )
+    return rows
+
+
+def _filter_session_search_rows(search):
+    needle = str(search or "").casefold()
+    return [
+        (doc_id, data)
+        for doc_id, data in _get_session_search_rows()
+        if needle in (
+            f"{data.get('username', '')} {data.get('user_id', '')}".casefold()
+        )
+    ]
 
 
 def get_sessions_admin(limit=50, offset=0, search=None):
-    db = _get_db()
-    query = db.collection(COL_SESSIONS).order_by(
+    if search:
+        rows = _filter_session_search_rows(search)[offset:offset + limit]
+        return [_format_session_admin_row(doc_id, data) for doc_id, data in rows]
+
+    query = _get_db().collection(COL_SESSIONS).order_by(
         "last_active_at", direction=firestore.Query.DESCENDING
     )
-    # Not: Firestore'da OFFSET büyük veri setlerinde verimsizdir; küçük/orta
-    # ölçekli bir bot için sorun teşkil etmez.
-    docs = list(query.limit(limit + offset).stream())[offset:offset + limit]
-
-    results = []
-    for doc in docs:
-        data = doc.to_dict()
-        if search:
-            haystack = f"{data.get('username','')} {data.get('user_id','')}".lower()
-            if search.lower() not in haystack:
-                continue
-
-        # YENİ: her oturum için ayrı bir evaluations sorgusu atmak yerine
-        # (N+1 problemi), toplam/adet doğrudan session dokümanında tutuluyor
-        # (bkz. add_evaluation), ortalama buradan anlık hesaplanıyor.
-        rating_sum = data.get("rating_sum", 0) or 0
-        rating_count = data.get("rating_count", 0) or 0
-
-        results.append({
-            "session_id": doc.id,
-            "user_id": data.get("user_id"),
-            "username": data.get("username"),
-            "started_at": _iso(data.get("started_at")),
-            "last_active_at": _iso(data.get("last_active_at")),
-            "message_count": data.get("message_count", 0),
-            "is_active": data.get("is_active", False),
-            "summary": data.get("summary", ""),
-            "avg_rating": round(rating_sum / rating_count, 2) if rating_count else None,
-            "evaluation_count": rating_count,
-            "intent_counts": data.get("intent_counts", {}),
-            "outcome_counts": data.get("outcome_counts", {}),
-            "last_intent": data.get("last_intent"),
-            "last_outcome": data.get("last_outcome"),
-        })
-    return results
+    docs = _query_page_with_cursor(
+        query,
+        cache_key="sessions",
+        limit=limit,
+        offset=offset,
+    )
+    return [
+        _format_session_admin_row(doc.id, doc.to_dict() or {})
+        for doc in docs
+    ]
 
 
 def count_sessions_admin(search=None):
-    db = _get_db()
     if not search:
-        return db.collection(COL_SESSIONS).count().get()[0][0].value
-    # search verilmişse tam sayım için tüm dokümanları taramak gerekiyor
-    count = 0
-    for doc in db.collection(COL_SESSIONS).select(["username", "user_id"]).stream():
-        data = doc.to_dict()
-        haystack = f"{data.get('username','')} {data.get('user_id','')}".lower()
-        if search.lower() in haystack:
-            count += 1
-    return count
+        return _get_db().collection(COL_SESSIONS).count().get()[0][0].value
+    # Liste ile aynı kısa süreli cache kullanılır; her tuş vuruşunda koleksiyon
+    # yeniden taranmaz ve sayım ikinci bir Firestore sorgusu oluşturmaz.
+    return len(_filter_session_search_rows(search))
+
+
+def session_exists(session_id):
+    """Puanlama gibi yalnızca varlık kontrolü isteyen yollar için tek okuma."""
+    return (
+        _get_db().collection(COL_SESSIONS).document(session_id).get().exists
+    )
 
 
 def get_session_admin_detail(session_id):
@@ -1343,14 +1747,11 @@ def get_session_admin_detail(session_id):
         evaluations.append({"id": d.id, **row})
 
     user_facts = get_user_facts(session.get("user_id"))
-    performance_metrics = get_performance_metrics_admin(
+    performance_bundle = get_performance_metrics_bundle(
         limit=100,
         offset=0,
         session_id=session_id,
-    )
-    performance_averages = get_performance_metrics_averages(
-        sample_size=200,
-        session_id=session_id,
+        include_total=False,
     )
     voice_recordings = get_voice_recordings_admin(session_id)
     voice_ai_evaluations = get_voice_ai_evaluations_admin(session_id)
@@ -1361,8 +1762,8 @@ def get_session_admin_detail(session_id):
         "tool_calls": tool_calls,
         "evaluations": evaluations,
         "user_facts": user_facts,
-        "performance_metrics": performance_metrics,
-        "performance_averages": performance_averages,
+        "performance_metrics": performance_bundle["data"],
+        "performance_averages": performance_bundle["averages"],
         "voice_recordings": voice_recordings,
         "voice_ai_evaluations": voice_ai_evaluations,
     }
@@ -1373,7 +1774,12 @@ def get_tool_calls_admin(limit=100, offset=0):
     query = db.collection(COL_API_LOGS).order_by(
         "timestamp", direction=firestore.Query.DESCENDING
     )
-    docs = list(query.limit(limit + offset).stream())[offset:offset + limit]
+    docs = _query_page_with_cursor(
+        query,
+        cache_key="tool_calls",
+        limit=limit,
+        offset=offset,
+    )
 
     # YENİ: kullanıcı adı artık log_tool_call() içinde doğrudan kaydediliyor,
     # bu yüzden burada oturum başına ekstra bir sorgu atmıyoruz (eski N+1
@@ -1425,59 +1831,63 @@ def _get_performance_metric_docs(
     session_id=None,
     recording_id=None,
     scan_limit=None,
+    since=None,
 ):
-    """Performans belgelerini en yeniden eskiye getirir.
-
-    Session filtresi Python tarafında sıralanır; böylece Firestore'da
-    session_id + created_at birleşik indeksine ihtiyaç duyulmaz.
-    """
+    """Performans belgelerini Firestore'da sıralayıp sınırlandırarak getirir."""
     db = _get_db()
     collection = db.collection(COL_PERFORMANCE_METRICS)
+    query = collection
     if recording_id:
-        docs = list(
-            collection
-            .where(filter=FieldFilter("recording_id", "==", recording_id))
-            .stream()
+        query = query.where(
+            filter=FieldFilter("recording_id", "==", recording_id)
         )
-        docs.sort(
-            key=lambda d: (
-                d.to_dict().get("created_at").timestamp()
-                if isinstance(d.to_dict().get("created_at"), datetime)
-                else 0
-            ),
-            reverse=True,
+    elif session_id:
+        query = query.where(
+            filter=FieldFilter("session_id", "==", session_id)
         )
-        return docs[:scan_limit] if scan_limit is not None else docs
-    if session_id:
-        docs = list(
-            collection
-            .where(filter=FieldFilter("session_id", "==", session_id))
-            .stream()
-        )
-        docs.sort(
-            key=lambda d: (
-                d.to_dict().get("created_at").timestamp()
-                if isinstance(d.to_dict().get("created_at"), datetime)
-                else 0
-            ),
-            reverse=True,
-        )
-        return docs[:scan_limit] if scan_limit is not None else docs
+    if since is not None:
+        query = query.where(filter=FieldFilter("created_at", ">=", since))
 
-    query = collection.order_by(
+    ordered_query = query.order_by(
         "created_at", direction=firestore.Query.DESCENDING
     )
     if scan_limit is not None:
-        query = query.limit(scan_limit)
-    return list(query.stream())
+        ordered_query = ordered_query.limit(scan_limit)
+    try:
+        return list(ordered_query.stream())
+    except FailedPrecondition:
+        # Kod ile index deploy'u kısa süre farklı sürümlerde kalırsa admin/QA
+        # ekranı bozulmasın. Index hazır olana kadar eski, pahalı yol kullanılır.
+        if not (recording_id or session_id):
+            raise
+        fallback_query = collection
+        if recording_id:
+            fallback_query = fallback_query.where(
+                filter=FieldFilter("recording_id", "==", recording_id)
+            )
+        else:
+            fallback_query = fallback_query.where(
+                filter=FieldFilter("session_id", "==", session_id)
+            )
+        docs = list(fallback_query.stream())
+        if since is not None:
+            docs = [
+                doc for doc in docs
+                if isinstance((doc.to_dict() or {}).get("created_at"), datetime)
+                and (doc.to_dict() or {}).get("created_at") >= since
+            ]
+        docs.sort(
+            key=lambda d: (
+                (d.to_dict() or {}).get("created_at").timestamp()
+                if isinstance((d.to_dict() or {}).get("created_at"), datetime)
+                else 0
+            ),
+            reverse=True,
+        )
+        return docs[:scan_limit] if scan_limit is not None else docs
 
 
-def get_performance_metrics_admin(limit=25, offset=0, session_id=None):
-    docs = _get_performance_metric_docs(
-        session_id=session_id,
-        scan_limit=limit + offset,
-    )[offset:offset + limit]
-
+def _format_performance_metric_docs(docs):
     results = []
     for d in docs:
         data = d.to_dict()
@@ -1497,6 +1907,14 @@ def get_performance_metrics_admin(limit=25, offset=0, session_id=None):
     return results
 
 
+def get_performance_metrics_admin(limit=25, offset=0, session_id=None):
+    docs = _get_performance_metric_docs(
+        session_id=session_id,
+        scan_limit=limit + offset,
+    )[offset:offset + limit]
+    return _format_performance_metric_docs(docs)
+
+
 def count_performance_metrics_admin(session_id=None):
     db = _get_db()
     query = db.collection(COL_PERFORMANCE_METRICS)
@@ -1509,6 +1927,8 @@ def get_performance_metrics_averages(
     sample_size=200,
     session_id=None,
     recording_id=None,
+    *,
+    docs=None,
 ):
     """Aynı geçerli başarı kohortu üzerinden karşılaştırılabilir ortalamalar.
 
@@ -1517,12 +1937,13 @@ def get_performance_metrics_averages(
     üç temel alanı da dolu, başarılı ve süre değişmezlerini sağlayan belgeler
     alınır. Eski/bozuk belgeler ortalamayı etkilemez.
     """
-    docs = _get_performance_metric_docs(
-        session_id=session_id,
-        recording_id=recording_id,
-        # Hatalı/eksik kayıtları eledikten sonra da yeterli örnek kalabilsin.
-        scan_limit=max(sample_size * 5, sample_size),
-    )
+    if docs is None:
+        docs = _get_performance_metric_docs(
+            session_id=session_id,
+            recording_id=recording_id,
+            # Hatalı/eksik kayıtları eledikten sonra da yeterli örnek kalabilsin.
+            scan_limit=max(sample_size * 5, sample_size),
+        )
 
     def is_number(value):
         return isinstance(value, (int, float)) and not isinstance(value, bool)
@@ -1581,3 +2002,75 @@ def get_performance_metrics_averages(
         if data.get("created_at") is not None and is_number(data.get("e2e_ms"))
     ]
     return averages
+
+
+def get_performance_metrics_bundle(
+    limit=25,
+    offset=0,
+    session_id=None,
+    *,
+    sample_size=200,
+    include_total=True,
+):
+    """Tablo ve ortalamayı aynı Firestore belge kümesinden üretir."""
+    scan_limit = max(limit + offset, sample_size * 5, sample_size)
+    cache_key = str(session_id or "__global__")
+    now_ts = time.monotonic()
+    cached = None
+    if _PERFORMANCE_CACHE_TTL_SECONDS > 0:
+        with _performance_cache_lock:
+            candidate = _performance_docs_cache.get(cache_key)
+            if (
+                candidate
+                and candidate["expires_at"] > now_ts
+                and (
+                    len(candidate["docs"]) >= scan_limit
+                    or len(candidate["docs"]) < candidate["scan_limit"]
+                )
+            ):
+                cached = candidate
+
+    if cached is None:
+        docs = _get_performance_metric_docs(
+            session_id=session_id,
+            scan_limit=scan_limit,
+        )
+        cached = {
+            "docs": docs,
+            "total": None,
+            "scan_limit": scan_limit,
+            "expires_at": now_ts + _PERFORMANCE_CACHE_TTL_SECONDS,
+        }
+    else:
+        docs = cached["docs"]
+
+    if include_total and cached["total"] is None:
+        cached["total"] = count_performance_metrics_admin(
+            session_id=session_id
+        )
+
+    if _PERFORMANCE_CACHE_TTL_SECONDS > 0:
+        with _performance_cache_lock:
+            if (
+                cache_key not in _performance_docs_cache
+                and len(_performance_docs_cache) >= 16
+            ):
+                oldest_key = next(iter(_performance_docs_cache))
+                _performance_docs_cache.pop(oldest_key, None)
+            _performance_docs_cache[cache_key] = cached
+
+    return {
+        "data": _format_performance_metric_docs(
+            docs[offset:offset + limit]
+        ),
+        "averages": get_performance_metrics_averages(
+            sample_size=sample_size,
+            session_id=session_id,
+            docs=docs,
+        ),
+        "total": (
+            cached["total"]
+            if include_total
+            else None
+        ),
+    }
