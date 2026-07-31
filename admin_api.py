@@ -17,11 +17,16 @@ Firebase Auth ile giriş yapmış + yetkili admin'lere Cloud Functions
 içindeki assertBotAdmin / getBotAdminAccess ve public/js/admin-bot.js.
 """
 
+import csv
+import io
+import json
 import os
 import secrets
+from datetime import datetime, timezone
 from functools import wraps
+from urllib.parse import urlparse
 
-from flask import Blueprint, jsonify, redirect, render_template, request
+from flask import Blueprint, Response, jsonify, redirect, render_template, request
 
 import database as db
 from evaluation_service import EVALUATION_MODEL, schedule_voice_evaluation
@@ -86,6 +91,42 @@ def _pagination_params(default_limit=50, max_limit=200):
     offset = max(0, offset)
 
     return limit, offset
+
+
+def _bounded_int_arg(name, default, minimum, maximum):
+    try:
+        value = int(request.args.get(name, default))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(value, maximum))
+
+
+def _csv_cell(value):
+    if value is None:
+        return ""
+    if isinstance(value, (dict, list, tuple)):
+        value = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    if isinstance(value, str) and value[:1] in {"=", "+", "-", "@"}:
+        # Excel formulu enjeksiyonunu engelle; degeri gorunur tut.
+        return "'" + value
+    return value
+
+
+def _csv_response(filename, headers, rows):
+    output = io.StringIO(newline="")
+    output.write("\ufeff")  # Excel'in Turkce karakterleri UTF-8 acmasi icin BOM.
+    writer = csv.writer(output, lineterminator="\r\n")
+    writer.writerow(headers)
+    for row in rows:
+        writer.writerow([_csv_cell(value) for value in row])
+    response = Response(
+        output.getvalue(),
+        status=200,
+        content_type="text/csv; charset=utf-8",
+    )
+    response.headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @admin_bp.route("/overview", methods=["GET"])
@@ -227,6 +268,126 @@ def performance_metrics():
             "total": bundle["total"],
         },
     }), 200
+
+
+@admin_bp.route("/monitoring", methods=["GET"])
+@require_admin_key
+def monitoring_config():
+    """Admin paneline gizli bilgi icermeyen Grafana baglanti durumunu ver."""
+    dashboard_url = os.environ.get("GRAFANA_DASHBOARD_URL", "").strip()
+    parsed = urlparse(dashboard_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        dashboard_url = None
+    return jsonify({
+        "status": "success",
+        "data": {
+            "grafana_configured": bool(dashboard_url),
+            "grafana_dashboard_url": dashboard_url,
+            "prometheus_endpoint": "/metrics",
+            "metrics_auth_enabled": bool(
+                os.environ.get("METRICS_BEARER_TOKEN", "")
+            ),
+            "structured_logging": True,
+            "service": os.environ.get("OTEL_SERVICE_NAME", "cinebot-api"),
+            "environment": os.environ.get(
+                "CINEBOT_ENVIRONMENT",
+                os.environ.get("RENDER_SERVICE_NAME", "development"),
+            ),
+        },
+    }), 200
+
+
+@admin_bp.route("/reports/overview.csv", methods=["GET"])
+@require_admin_key
+def overview_csv_report():
+    days = _bounded_int_arg("days", 30, 1, 90)
+    data = db.get_admin_overview(days=days)
+    generated_at = datetime.now(timezone.utc).isoformat()
+    rows = []
+
+    general_metrics = (
+        ("total_sessions", "Toplam oturum", "adet"),
+        ("active_sessions", "Aktif oturum", "adet"),
+        ("total_messages", "Toplam mesaj", "adet"),
+        ("total_users", "Benzersiz kullanici", "adet"),
+        ("total_tool_calls", "Tool cagrisi", "adet"),
+        ("successful_tool_calls", "Basarili tool cagrisi", "adet"),
+        ("failed_tool_calls", "Basarisiz tool cagrisi", "adet"),
+        ("avg_rating", "Ortalama puan", "puan/5"),
+        ("total_evaluations", "Degerlendirme", "adet"),
+        ("classified_messages", "Siniflandirilan tur", "adet"),
+        ("success_rate", "Basari orani", "yuzde"),
+        ("fallback_rate", "Fallback orani", "yuzde"),
+        ("technical_error_rate", "Teknik hata orani", "yuzde"),
+    )
+    for key, label, unit in general_metrics:
+        rows.append(("genel", label, "", data.get(key), unit, days, generated_at))
+
+    for item in data.get("daily_messages", []):
+        rows.append(("gunluk_mesaj", "Mesaj hacmi", item.get("day"), item.get("c"), "adet", days, generated_at))
+    for item in data.get("intent_distribution", []):
+        rows.append(("intent", "Kullanici niyeti", item.get("intent"), item.get("count"), "adet", days, generated_at))
+    for item in data.get("outcome_distribution", []):
+        rows.append(("outcome", "Islem sonucu", item.get("outcome"), item.get("count"), "adet", days, generated_at))
+    for item in data.get("rating_distribution", []):
+        rows.append(("puan", "Puan dagilimi", item.get("rating"), item.get("c"), "adet", days, generated_at))
+    for item in data.get("top_movies", []):
+        rows.append(("film", item.get("movie_name"), "sorgu_sayisi", item.get("c"), "adet", days, generated_at))
+        rows.append(("film", item.get("movie_name"), "ortalama_tool_suresi", item.get("avg_duration_ms"), "ms", days, generated_at))
+
+    return _csv_response(
+        f"cinebot-genel-rapor-{days}-gun.csv",
+        ("bolum", "metrik", "boyut", "deger", "birim", "donem_gun", "olusturulma_zamani_utc"),
+        rows,
+    )
+
+
+@admin_bp.route("/reports/performance.csv", methods=["GET"])
+@require_admin_key
+def performance_csv_report():
+    days = _bounded_int_arg("days", 30, 1, 365)
+    limit = _bounded_int_arg("limit", 5000, 1, 5000)
+    session_id = request.args.get("session_id") or None
+    rows = db.get_performance_metrics_export_admin(
+        days=days,
+        limit=limit,
+        session_id=session_id,
+    )
+    headers = (
+        "id", "created_at", "session_id", "recording_id", "channel",
+        "input_type", "status", "failed_stage", "error_type", "outcome",
+        "measurement_valid", "measurement_errors", *db.PERFORMANCE_METRIC_FIELDS,
+    )
+    return _csv_response(
+        f"cinebot-performans-{days}-gun.csv",
+        headers,
+        ([row.get(header) for header in headers] for row in rows),
+    )
+
+
+@admin_bp.route("/reports/outcomes.csv", methods=["GET"])
+@require_admin_key
+def outcomes_csv_report():
+    days = _bounded_int_arg("days", 30, 1, 365)
+    limit = _bounded_int_arg("limit", 5000, 1, 5000)
+    analytics = db.get_outcome_analytics_admin(
+        days=days,
+        limit=limit,
+        scan_limit=limit,
+    )
+    headers = (
+        "id", "created_at", "session_id", "channel", "input_type", "intent",
+        "outcome", "intent_confidence", "outcome_confidence",
+        "classification_version", "error_stage", "error_type",
+    )
+    return _csv_response(
+        f"cinebot-sonuclar-{days}-gun.csv",
+        headers,
+        (
+            [row.get(header) for header in headers]
+            for row in analytics.get("recent_interactions", [])
+        ),
+    )
 
 
 @admin_bp.route("/voice-recordings", methods=["GET"])

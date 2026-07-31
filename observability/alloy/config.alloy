@@ -1,0 +1,41 @@
+local.file_match "cinebot_json_logs" {
+  path_targets = [{
+    "__path__"    = "/var/log/cinebot/*.log",
+    "job"         = "cinebot-api",
+    "service"     = "cinebot-api",
+    "environment" = "local",
+  }]
+}
+
+loki.source.file "cinebot_json_logs" {
+  targets       = local.file_match.cinebot_json_logs.targets
+  forward_to    = [loki.process.cinebot_json_logs.receiver]
+  tail_from_end = true
+}
+
+loki.process "cinebot_json_logs" {
+  stage.json {
+    expressions = {
+      level       = "",
+      service     = "",
+      environment = "",
+    }
+  }
+
+  stage.labels {
+    values = {
+      level       = "",
+      service     = "",
+      environment = "",
+    }
+  }
+
+  forward_to = [loki.write.local.receiver]
+}
+
+loki.write "local" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}
+

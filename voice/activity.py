@@ -1,5 +1,7 @@
 import asyncio
 
+from observability import set_active_voice_connections
+
 
 _active_connections = 0
 _idle_event = None
@@ -17,6 +19,7 @@ def _get_idle_event():
 def voice_connection_started():
     global _active_connections
     _active_connections += 1
+    set_active_voice_connections(_active_connections)
     _get_idle_event().clear()
     print("Aktif voice bağlantısı:", _active_connections)
 
@@ -24,6 +27,7 @@ def voice_connection_started():
 def voice_connection_finished():
     global _active_connections
     _active_connections = max(0, _active_connections - 1)
+    set_active_voice_connections(_active_connections)
     if _active_connections == 0:
         _get_idle_event().set()
     print("Aktif voice bağlantısı:", _active_connections)
@@ -37,4 +41,3 @@ async def wait_for_voice_idle(grace_seconds=15):
         await asyncio.sleep(grace_seconds)
         if _active_connections == 0:
             return
-

@@ -7,6 +7,7 @@ from aiohttp_wsgi import WSGIHandler
 from voice.config import PEER_CONNECTIONS
 from voice.legacy_webrtc import offer, options_handler
 from voice.streaming import voice_stream
+from observability import aiohttp_voice_observability
 
 
 async def close_peer_connections(app):
@@ -21,7 +22,7 @@ def create_app():
     os.environ["CINEMATCH_DEFER_SERVICE_INITIALIZATION"] = "1"
     import main as main_module
 
-    app = web.Application()
+    app = web.Application(middlewares=[aiohttp_voice_observability])
     app.router.add_get("/api/voice/stream", voice_stream)
     app.router.add_post("/api/voice/offer", offer)
     app.router.add_options("/api/voice/offer", options_handler)

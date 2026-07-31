@@ -301,7 +301,13 @@ async def handle_user_speech(track, pc, user_context, output_track):
                     elif event_type == "ConversationText":
                         role = event.get("role", "unknown")
                         content = str(event.get("content") or "").strip()
-                        print(f"[{role}]: {content}")
+                        # Ham transkript merkezi loga yazilmaz; yalnizca olay
+                        # tipi ve metin uzunlugu operasyonel olarak kaydedilir.
+                        print(
+                            "Deepgram konuşma metni olayı:",
+                            f"role={role}",
+                            f"characters={len(content)}",
+                        )
                         if role == "user" and content:
                             flush_completed_turn()
                             pending_user_text = content

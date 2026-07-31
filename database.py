@@ -1,5 +1,6 @@
 import os
 import json
+import logging
 import time
 import threading
 import random
@@ -14,6 +15,10 @@ from outcome_service import (
     VALID_OUTCOMES,
     categorize_interaction,
 )
+from observability import observe_performance_metric, observe_tool_call
+
+
+logger = logging.getLogger(__name__)
 
 # Oturum süresi
 SESSION_TIMEOUT_MINUTES = 30
@@ -194,7 +199,10 @@ def get_or_create_session_state(user_id, username):
         "last_outcome": None,
     })
     _invalidate_past_summary_cache(user_id)
-    print(f"SİSTEM: Kullanıcı {user_id} için yeni oturum açıldı -> session_id={new_doc.id}")
+    logger.info(
+        "Yeni kullanici oturumu acildi.",
+        extra={"event": "session_created", "session_id": new_doc.id},
+    )
     return {
         "session_id": new_doc.id,
         "message_count": 0,
@@ -252,7 +260,10 @@ def update_session_summary(session_id, summary_text, message_count=None):
     if isinstance(message_count, int) and message_count >= 0:
         updates["summary_message_count"] = message_count
     db.collection(COL_SESSIONS).document(session_id).update(updates)
-    print(f"SİSTEM: Oturum #{session_id} özeti güncellendi.")
+    logger.info(
+        "Oturum ozeti guncellendi.",
+        extra={"event": "session_summary_updated", "session_id": session_id},
+    )
 
 
 # ============================================================
@@ -1044,6 +1055,12 @@ def log_tool_call(
     query=None,
     duration_ms=None,
 ):
+    response_text = str(api_response or "")
+    success = (
+        '"Response": "True"' in response_text
+        or '"Response":"True"' in response_text
+    )
+    observe_tool_call(tool_name, duration_ms, success)
     db = _get_db()
     db.collection(COL_API_LOGS).document().set({
         "movie_name": movie_name,
@@ -1069,6 +1086,8 @@ def log_performance_metric(metric):
     eklenir. Mesaj/transkript/ses içeriği bu koleksiyona yazılmamalıdır.
     """
     payload = dict(metric)
+    # Firestore basarili kayitlari orneklese bile Prometheus tum olaylari gorur.
+    observe_performance_metric(payload)
     try:
         configured_sample_rate = float(os.environ.get(
             "PERFORMANCE_METRIC_SUCCESS_SAMPLE_RATE",
@@ -1145,7 +1164,10 @@ def update_user_facts(user_id, username, new_facts, *, existing_facts=None):
         "facts": existing,
         "updated_at": _now(),
     }, merge=True)
-    print(f"SİSTEM: Kullanıcı {user_id} profili güncellendi -> {existing}")
+    logger.info(
+        "Kullanici profili guncellendi.",
+        extra={"event": "user_profile_updated"},
+    )
     return existing
 
 
@@ -1894,10 +1916,14 @@ def _format_performance_metric_docs(docs):
         row = {
             "id": d.id,
             "created_at": _iso(data.get("created_at")),
+            "session_id": data.get("session_id"),
+            "recording_id": data.get("recording_id"),
             "channel": data.get("channel"),
             "input_type": data.get("input_type"),
             "status": data.get("status"),
             "failed_stage": data.get("failed_stage"),
+            "error_type": data.get("error_type"),
+            "outcome": data.get("outcome"),
             "measurement_valid": data.get("measurement_valid", True),
             "measurement_errors": data.get("measurement_errors", []),
         }
@@ -1912,6 +1938,17 @@ def get_performance_metrics_admin(limit=25, offset=0, session_id=None):
         session_id=session_id,
         scan_limit=limit + offset,
     )[offset:offset + limit]
+    return _format_performance_metric_docs(docs)
+
+
+def get_performance_metrics_export_admin(days=30, limit=5000, session_id=None):
+    """Yonetim CSV raporu icin zaman araligina gore performans satirlari."""
+    since = _now() - timedelta(days=max(1, min(int(days), 365)))
+    docs = _get_performance_metric_docs(
+        session_id=session_id,
+        scan_limit=max(1, min(int(limit), 5000)),
+        since=since,
+    )
     return _format_performance_metric_docs(docs)
 
 

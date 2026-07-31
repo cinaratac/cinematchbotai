@@ -1,0 +1,60 @@
+groups:
+  - name: cinebot-operational-alerts
+    rules:
+      - alert: CineBotInstanceDown
+        expr: up{job="cinebot-api"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: CineBot metrik ucu iki dakikadir erisilemiyor
+          description: Servis, ag veya /metrics endpoint'i kontrol edilmeli.
+
+      - alert: CineBotHighHttp5xxRate
+        expr: |
+          sum(rate(cinebot_http_requests_total{status_code=~"5.."}[5m]))
+          /
+          clamp_min(sum(rate(cinebot_http_requests_total[5m])), 0.001)
+          > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: CineBot HTTP 5xx orani yuzde 5 uzerinde
+          description: Son bes dakikadaki uygulama hatalari ve ilgili loglar incelenmeli.
+
+      - alert: CineBotSlowP95Response
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le) (rate(cinebot_http_request_duration_seconds_bucket[5m]))
+          ) > 10
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: CineBot P95 HTTP yanit suresi 10 saniyeyi asti
+          description: AI, tool ve Firestore gecikme panelleri kontrol edilmeli.
+
+      - alert: CineBotHighPipelineErrorRate
+        expr: |
+          sum(rate(cinebot_performance_records_total{status="error"}[10m]))
+          /
+          clamp_min(sum(rate(cinebot_performance_records_total[10m])), 0.001)
+          > 0.05
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: CineBot pipeline hata orani yuzde 5 uzerinde
+          description: failed_stage ve outcome kirilimlari incelenmeli.
+
+      - alert: CineBotHighProcessMemory
+        expr: process_resident_memory_bytes{job="cinebot-api"} > 536870912
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: CineBot process bellek kullanimi 512 MiB uzerinde
+          description: Voice baglantilari, kayit isleri ve bellek trendi kontrol edilmeli.
+

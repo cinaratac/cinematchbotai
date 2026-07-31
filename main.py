@@ -1,7 +1,13 @@
 import base64
+import logging
 import os
 import time
 from io import BytesIO
+
+from logging_config import configure_logging
+
+configure_logging()
+
 import telebot
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -32,6 +38,10 @@ from outcome_service import (
     OUTCOME_SUCCESS,
     OUTCOME_TECHNICAL_ERROR,
 )
+from observability import init_flask_observability
+
+
+logger = logging.getLogger(__name__)
 
 
 # --- GİZLİ ANAHTARLAR (Görev 11): artık koddan değil ortam değişkenlerinden
@@ -61,6 +71,7 @@ app.json.ensure_ascii = False
 # tarayıcıdan farklı bir origin'den (site domaini) çağıracağı için CORS'u
 # sadece /api/ altındaki uçlar için açıyoruz.
 CORS(app, resources={r"/api/*": {"origins": "*"}})
+init_flask_observability(app)
 
 # Admin paneli uçları (/api/admin/...): konuşma/tool/değerlendirme verisi.
 # Kendi X-Admin-Key header kontrolüyle korunur (bkz. admin_api.py).
@@ -71,15 +82,24 @@ def _register_webhook():
     """Telegram'a, gelen mesajları PUBLIC_BASE_URL/{TOKEN} adresine göndermesini
     söyler."""
     if not bot:
-        print("UYARI: TELEGRAM_BOT_TOKEN tanımlı değil; Telegram botu devre dışı, sadece /api/chat aktif.")
+        logger.warning(
+            "Telegram botu devre disi; yalnizca API aktif.",
+            extra={"event": "telegram_disabled"},
+        )
         return
     try:
         bot.remove_webhook()
         bot.set_webhook(url=f"{PUBLIC_BASE_URL}/{TOKEN}")
         # Bot tokenı webhook yolunun bir parçasıdır; deploy loguna yazmayalım.
-        print("Telegram webhook ayarlandı.")
+        logger.info(
+            "Telegram webhook ayarlandi.",
+            extra={"event": "telegram_webhook_configured"},
+        )
     except Exception as e:
-        print("WEBHOOK AYARLAMA HATASI:", e)
+        logger.exception(
+            "Telegram webhook ayarlanamadi.",
+            extra={"event": "telegram_webhook_error", "error_type": type(e).__name__},
+        )
 
 
 def initialize_services():
@@ -117,7 +137,10 @@ if bot:
             )
             touch_session(session_id, logged)
         except Exception as log_error:
-            print("START MESAJI LOG HATASI:", log_error)
+            logger.exception(
+                "Start mesaji kaydedilemedi.",
+                extra={"event": "chat_log_error", "error_type": type(log_error).__name__},
+            )
 
     @bot.message_handler(content_types=['photo'])
     def handle_photo(message):
@@ -125,7 +148,10 @@ if bot:
         content_types=['photo'] sayesinde bu handler SADECE fotoğraf mesajlarını
         yakalar; aşağıdaki metin handler'ı (varsayılan content_types=['text'])
         fotoğraflarla çakışmaz."""
-        print("Fotoğraf geldi.")
+        logger.info(
+            "Telegram fotograf istegi alindi.",
+            extra={"event": "telegram_photo_received", "channel": "telegram"},
+        )
         msg = bot.reply_to(message, "Fotoğrafı inceliyorum...")
 
         username = message.from_user.username if message.from_user.username else message.from_user.first_name
@@ -148,7 +174,10 @@ if bot:
                 channel="telegram",
             )
         except Exception as e:
-            print("FOTOĞRAF İŞLEME HATASI:", e)
+            logger.exception(
+                "Fotograf isleme hatasi.",
+                extra={"event": "photo_processing_error", "stage": "photo_processing", "error_type": type(e).__name__},
+            )
             answer = "Üzgünüm, fotoğrafı işlerken bir sorun oluştu, tekrar gönderir misin?"
             try:
                 failed = log_failed_interaction(
@@ -166,7 +195,10 @@ if bot:
                     "outcome": failed["outcome"],
                 }
             except Exception as log_error:
-                print("FOTOĞRAF HATA LOGU KAYDEDİLEMEDİ:", log_error)
+                logger.exception(
+                    "Fotograf hata kaydi yazilamadi.",
+                    extra={"event": "chat_log_error", "error_type": type(log_error).__name__},
+                )
 
         try:
             bot.edit_message_text(
@@ -175,7 +207,10 @@ if bot:
                 text=answer,
             )
         except Exception as send_error:
-            print("FOTOĞRAF CEVABI GÖNDERİLEMEDİ:", send_error)
+            logger.exception(
+                "Fotograf cevabi gonderilemedi.",
+                extra={"event": "telegram_send_error", "stage": "telegram_photo_send", "error_type": type(send_error).__name__},
+            )
             if diagnostics and diagnostics.get("chat_log_id"):
                 try:
                     update_chat_outcome(
@@ -185,7 +220,10 @@ if bot:
                         error_type=type(send_error).__name__,
                     )
                 except Exception as update_error:
-                    print("FOTOĞRAF OUTCOME GÜNCELLENEMEDİ:", update_error)
+                    logger.exception(
+                        "Fotograf sonucu guncellenemedi.",
+                        extra={"event": "outcome_update_error", "error_type": type(update_error).__name__},
+                    )
 
     @bot.message_handler(content_types=['voice', 'audio'])
     def handle_audio(message):
@@ -229,7 +267,10 @@ if bot:
             try:
                 log_performance_metric(metrics)
             except Exception as metric_error:
-                print("PERFORMANS LOG HATASI:", metric_error)
+                logger.exception(
+                    "Performans metrigi kaydedilemedi.",
+                    extra={"event": "performance_metric_error", "error_type": type(metric_error).__name__},
+                )
 
         msg = bot.reply_to(message, "Sesini dinliyorum...")
         username = message.from_user.username or message.from_user.first_name
@@ -340,7 +381,10 @@ if bot:
                 metrics["status"] = "success"
                 save_metrics()
             except Exception as tts_error:
-                print("TTS HATASI:", tts_error)
+                logger.exception(
+                    "TTS hatasi.",
+                    extra={"event": "tts_error", "stage": "tts", "error_type": type(tts_error).__name__},
+                )
                 metrics["status"] = "partial_success"
                 metrics["failed_stage"] = current_stage
                 metrics["error_type"] = type(tts_error).__name__
@@ -362,10 +406,16 @@ if bot:
                         if changed:
                             metrics["outcome"] = OUTCOME_PARTIAL_SUCCESS
                     except Exception as update_error:
-                        print("SES OUTCOME GÜNCELLENEMEDİ:", update_error)
+                        logger.exception(
+                            "Ses sonucu guncellenemedi.",
+                            extra={"event": "outcome_update_error", "error_type": type(update_error).__name__},
+                        )
                 save_metrics()
         except Exception as e:
-            print("SES İŞLEME HATASI:", e)
+            logger.exception(
+                "Ses isleme hatasi.",
+                extra={"event": "voice_processing_error", "stage": current_stage, "error_type": type(e).__name__},
+            )
             metrics["status"] = "error"
             metrics["failed_stage"] = current_stage
             metrics["error_type"] = type(e).__name__
@@ -380,7 +430,10 @@ if bot:
                         error_type=type(e).__name__,
                     )
                 except Exception as update_error:
-                    print("SES OUTCOME GÜNCELLENEMEDİ:", update_error)
+                    logger.exception(
+                        "Ses sonucu guncellenemedi.",
+                        extra={"event": "outcome_update_error", "error_type": type(update_error).__name__},
+                    )
             else:
                 try:
                     failed = log_failed_interaction(
@@ -399,7 +452,10 @@ if bot:
                     metrics["session_id"] = failed["session_id"]
                     metrics["intent"] = failed["intent"]
                 except Exception as log_error:
-                    print("SES HATA LOGU KAYDEDİLEMEDİ:", log_error)
+                    logger.exception(
+                        "Ses hata kaydi yazilamadi.",
+                        extra={"event": "chat_log_error", "error_type": type(log_error).__name__},
+                    )
             save_metrics()
             bot.edit_message_text(
                 chat_id=message.chat.id,
@@ -410,7 +466,10 @@ if bot:
     @bot.message_handler(func=lambda message: True)
     def handle_all_messages(message):
         pipeline_started = time.perf_counter()
-        print("Soru geldi:", message.text)
+        logger.info(
+            "Telegram metin istegi alindi.",
+            extra={"event": "telegram_text_received", "channel": "telegram"},
+        )
         msg = bot.reply_to(message, "Düşünmekteyim...")
 
         username = message.from_user.username if message.from_user.username else message.from_user.first_name
@@ -484,7 +543,10 @@ if bot:
             metrics["e2e_ms"] = round(
                 (time.perf_counter() - pipeline_started) * 1000
             )
-            print("TELEGRAM METİN İŞLEME HATASI:", e)
+            logger.exception(
+                "Telegram metin isleme hatasi.",
+                extra={"event": "text_processing_error", "channel": "telegram", "error_type": type(e).__name__},
+            )
             if diagnostics and diagnostics.get("chat_log_id"):
                 try:
                     update_chat_outcome(
@@ -494,7 +556,10 @@ if bot:
                         error_type=type(e).__name__,
                     )
                 except Exception as update_error:
-                    print("METİN OUTCOME GÜNCELLENEMEDİ:", update_error)
+                    logger.exception(
+                        "Metin sonucu guncellenemedi.",
+                        extra={"event": "outcome_update_error", "error_type": type(update_error).__name__},
+                    )
             else:
                 try:
                     failed = log_failed_interaction(
@@ -513,7 +578,10 @@ if bot:
                     metrics["session_id"] = failed["session_id"]
                     metrics["intent"] = failed["intent"]
                 except Exception as log_error:
-                    print("METİN HATA LOGU KAYDEDİLEMEDİ:", log_error)
+                    logger.exception(
+                        "Metin hata kaydi yazilamadi.",
+                        extra={"event": "chat_log_error", "error_type": type(log_error).__name__},
+                    )
             try:
                 bot.edit_message_text(
                     chat_id=message.chat.id,
@@ -521,12 +589,18 @@ if bot:
                     text="Üzgünüm, mesajını işlerken bir sorun oluştu. Tekrar dener misin?",
                 )
             except Exception as send_error:
-                print("TELEGRAM HATA MESAJI GÖNDERİLEMEDİ:", send_error)
+                logger.exception(
+                    "Telegram hata mesaji gonderilemedi.",
+                    extra={"event": "telegram_send_error", "error_type": type(send_error).__name__},
+                )
         finally:
             try:
                 log_performance_metric(metrics)
             except Exception as metric_error:
-                print("PERFORMANS LOG HATASI:", metric_error)
+                logger.exception(
+                    "Performans metrigi kaydedilemedi.",
+                    extra={"event": "performance_metric_error", "error_type": type(metric_error).__name__},
+                )
 
     @app.route('/' + TOKEN, methods=['POST'])
     def getMessage():
@@ -614,8 +688,14 @@ def api_chat():
         try:
             log_performance_metric(metrics)
         except Exception as metric_error:
-            print("PERFORMANS LOG HATASI:", metric_error)
-        print("LOG BAŞARILI: API isteği Firestore veritabanına kaydedildi.")
+            logger.exception(
+                "Performans metrigi kaydedilemedi.",
+                extra={"event": "performance_metric_error", "error_type": type(metric_error).__name__},
+            )
+        logger.info(
+            "API istegi tamamlandi.",
+            extra={"event": "api_chat_completed", "channel": "api", "status": "success", "session_id": session_id},
+        )
         return jsonify({
             "status": "success",
             "bot_response": ai_response,
@@ -641,7 +721,10 @@ def api_chat():
                     error_type=type(e).__name__,
                 )
             except Exception as update_error:
-                print("API OUTCOME GÜNCELLENEMEDİ:", update_error)
+                logger.exception(
+                    "API sonucu guncellenemedi.",
+                    extra={"event": "outcome_update_error", "error_type": type(update_error).__name__},
+                )
         else:
             try:
                 failed = log_failed_interaction(
@@ -657,11 +740,21 @@ def api_chat():
                 metrics["session_id"] = failed["session_id"]
                 metrics["intent"] = failed["intent"]
             except Exception as log_error:
-                print("API HATA LOGU KAYDEDİLEMEDİ:", log_error)
+                logger.exception(
+                    "API hata kaydi yazilamadi.",
+                    extra={"event": "chat_log_error", "error_type": type(log_error).__name__},
+                )
         try:
             log_performance_metric(metrics)
         except Exception as metric_error:
-            print("PERFORMANS LOG HATASI:", metric_error)
+            logger.exception(
+                "Performans metrigi kaydedilemedi.",
+                extra={"event": "performance_metric_error", "error_type": type(metric_error).__name__},
+            )
+        logger.exception(
+            "API chat istegi basarisiz.",
+            extra={"event": "api_chat_failed", "channel": "api", "status": "error", "stage": metrics["failed_stage"], "error_type": type(e).__name__},
+        )
         return jsonify({"status": "error", "message": str(e)}), 500
 
 

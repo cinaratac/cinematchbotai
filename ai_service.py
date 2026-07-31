@@ -1,4 +1,5 @@
 import base64
+import logging
 import os
 import re
 import time
@@ -24,6 +25,9 @@ from outcome_service import (
     OUTCOME_TECHNICAL_ERROR,
     categorize_interaction,
 )
+
+
+logger = logging.getLogger(__name__)
 
 # --- GİZLİ ANAHTARLAR: ortam değişkenlerinden okunuyor. Render'da
 # "Environment" sekmesinden şunları tanımlaman gerekiyor:
@@ -781,7 +785,17 @@ sohbetin doğal devamıymış gibi bak, aynı cümleleri tekrar etme.
         if 'choices' not in response_data:
             error_info = response_data.get('error', {})
             error_code = error_info.get('code')
-            print("OPENROUTER'DAN GELEN HATA:", response_data)
+            logger.error(
+                "OpenRouter istegi hata dondurdu.",
+                extra={
+                    "event": "openrouter_error",
+                    "stage": "openrouter",
+                    "status_code": error_code,
+                    "error_type": str(
+                        error_info.get("type") or "provider_error"
+                    )[:80],
+                },
+            )
             outcome_hint = OUTCOME_TECHNICAL_ERROR
             error_stage = "openrouter"
             error_type = f"OpenRouterError:{error_code or 'unknown'}"
@@ -809,7 +823,13 @@ sohbetin doğal devamıymış gibi bak, aynı cümleleri tekrar etme.
                         final_answer = "Hangi filmden bahsediyorsun, film adını yazabilir misin?"
                         outcome_hint = OUTCOME_FALLBACK
                     else:
-                        print(f"SİSTEM: Yapay zeka OMDb'den şu filmi çekiyor: {movie_name}")
+                        logger.info(
+                            "AI film verisi aracini cagiriyor.",
+                            extra={
+                                "event": "tool_call_requested",
+                                "stage": "get_live_movie_data",
+                            },
+                        )
                         function_result = get_live_movie_data(
                             movie_name,
                             session_id=session_id,
@@ -1028,7 +1048,17 @@ KULLANICI GEÇMİŞİ (arka plan):
 
         if 'choices' not in response_data:
             error_info = response_data.get('error', {})
-            print("OPENROUTER'DAN GELEN HATA (görüntü):", response_data)
+            logger.error(
+                "OpenRouter gorsel istegi hata dondurdu.",
+                extra={
+                    "event": "openrouter_error",
+                    "stage": "vision_openrouter",
+                    "status_code": error_info.get("code"),
+                    "error_type": str(
+                        error_info.get("type") or "provider_error"
+                    )[:80],
+                },
+            )
             outcome_hint = OUTCOME_TECHNICAL_ERROR
             error_stage = "vision_openrouter"
             error_type = (
