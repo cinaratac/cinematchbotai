@@ -129,6 +129,12 @@ GET /api/admin/reports/outcomes.csv?days=30&limit=5000
 GET /api/admin/reports/performance.csv?days=30&limit=5000
 ```
 
+`overview.csv`, secilen doneme ait KPI'lari tek bir yonetici ozeti satirinda
+verir; tum-zaman degerlerini donem raporu gibi etiketlemez. `outcomes.csv`,
+siniflandirilmamis eski kayitlar dahil konusma turlarini kullanici mesaji, bot
+cevabi ve siniflandirma alanlariyla indirir. Tool cagrilari bu sonuc raporuna
+karistirilmaz. `performance.csv` ise ham sure ve pipeline olcumlerini verir.
+
 Dosyalar UTF-8 BOM icerir, Excel'de Turkce karakterlerle acilir ve kullanici
 kaynakli hucrelerde CSV/Excel formul enjeksiyonuna karsi koruma uygulanir.
 Grafana panelleri ayrica `Inspect > Data > Download CSV` ile indirilebilir.

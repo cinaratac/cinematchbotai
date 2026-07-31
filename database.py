@@ -1463,6 +1463,132 @@ def get_admin_overview(days=14):
     return result
 
 
+def get_admin_report_summary(days=30, scan_limit=5000):
+    """Secilen doneme ait, CSV yonetici ozeti icin tutarli KPI'lar.
+
+    Admin ekranindaki genel bakis tum-zaman KPI'larini gostermeye devam eder.
+    Indirilen donem raporu ise yalnizca belirtilen tarih araliginda baslayan
+    oturumlari ve olusan mesaj/tool/degerlendirme kayitlarini kapsar.
+    """
+    days = max(1, min(int(days), 365))
+    scan_limit = max(1, min(int(scan_limit), 5000))
+    period_end = _now()
+    period_start = period_end - timedelta(days=days)
+    db = _get_db()
+
+    session_docs = list(
+        db.collection(COL_SESSIONS)
+        .where(filter=FieldFilter("started_at", ">=", period_start))
+        .select(["user_id", "is_active"])
+        .stream()
+    )
+    unique_users = {
+        str((doc.to_dict() or {}).get("user_id"))
+        for doc in session_docs
+        if (doc.to_dict() or {}).get("user_id") is not None
+    }
+
+    message_query = db.collection(COL_CHAT_LOGS).where(
+        filter=FieldFilter("created_at", ">=", period_start)
+    )
+    total_messages = message_query.count().get()[0][0].value
+
+    tool_query = db.collection(COL_API_LOGS).where(
+        filter=FieldFilter("timestamp", ">=", period_start)
+    )
+    total_tool_calls = tool_query.count().get()[0][0].value
+    tool_docs = list(tool_query.limit(scan_limit).stream())
+    successful_tool_calls = 0
+    movie_counts = {}
+    for doc in tool_docs:
+        data = doc.to_dict() or {}
+        response_text = str(data.get("api_response") or "")
+        if (
+            '"Response": "True"' in response_text
+            or '"Response":"True"' in response_text
+        ):
+            successful_tool_calls += 1
+        movie_name = str(data.get("movie_name") or "").strip()
+        if movie_name:
+            movie_counts[movie_name] = movie_counts.get(movie_name, 0) + 1
+
+    evaluation_docs = list(
+        db.collection(COL_EVALUATIONS)
+        .where(filter=FieldFilter("created_at", ">=", period_start))
+        .select(["rating"])
+        .stream()
+    )
+    ratings = [
+        (doc.to_dict() or {}).get("rating")
+        for doc in evaluation_docs
+        if isinstance((doc.to_dict() or {}).get("rating"), (int, float))
+        and not isinstance((doc.to_dict() or {}).get("rating"), bool)
+    ]
+
+    analytics = get_outcome_analytics_admin(
+        days=days,
+        limit=1,
+        scan_limit=scan_limit,
+    )
+    top_intent = next(iter(analytics.get("intent_distribution", [])), {})
+    top_outcome = next(iter(analytics.get("outcome_distribution", [])), {})
+    top_movie = (
+        max(movie_counts.items(), key=lambda item: item[1])
+        if movie_counts
+        else (None, 0)
+    )
+    classified_count = analytics.get("classified_count", 0)
+    unclassified_count = analytics.get("unclassified_count", 0)
+
+    # Tool dokumanlari sinira takilirsa basari sayisi bir orneklemdir; toplam
+    # basari sayisini ornek basari oranindan tahmin ederek bunu acikca isaretle.
+    tool_scan_truncated = total_tool_calls > len(tool_docs)
+    if tool_scan_truncated and tool_docs:
+        successful_tool_calls = round(
+            total_tool_calls * successful_tool_calls / len(tool_docs)
+        )
+
+    return {
+        "period_start": period_start.isoformat(),
+        "period_end": period_end.isoformat(),
+        "days": days,
+        "total_sessions": len(session_docs),
+        "active_sessions": sum(
+            1
+            for doc in session_docs
+            if bool((doc.to_dict() or {}).get("is_active"))
+        ),
+        "total_messages": total_messages,
+        "total_users": len(unique_users),
+        "total_tool_calls": total_tool_calls,
+        "successful_tool_calls": successful_tool_calls,
+        "failed_tool_calls": max(0, total_tool_calls - successful_tool_calls),
+        "tool_success_rate": (
+            round(successful_tool_calls * 100 / total_tool_calls, 2)
+            if total_tool_calls
+            else None
+        ),
+        "avg_rating": round(sum(ratings) / len(ratings), 2) if ratings else None,
+        "total_evaluations": len(ratings),
+        "classified_messages": classified_count,
+        "unclassified_messages": unclassified_count,
+        "success_rate": analytics.get("rates", {}).get("success"),
+        "fallback_rate": analytics.get("rates", {}).get("fallback"),
+        "technical_error_rate": analytics.get("rates", {}).get(
+            "technical_error"
+        ),
+        "top_intent": top_intent.get("intent"),
+        "top_intent_count": top_intent.get("count", 0),
+        "top_outcome": top_outcome.get("outcome"),
+        "top_outcome_count": top_outcome.get("count", 0),
+        "top_movie": top_movie[0],
+        "top_movie_count": top_movie[1],
+        "data_truncated": bool(
+            analytics.get("scan_truncated") or tool_scan_truncated
+        ),
+    }
+
+
 def get_outcome_analytics_admin(
     days=30,
     limit=50,
@@ -1628,6 +1754,55 @@ def get_outcome_analytics_admin(
                 "data": result,
             }
     return result
+
+
+def get_outcome_rows_export_admin(days=30, limit=5000):
+    """Secilen donemdeki tum konusma turlarini CSV icin dondurur.
+
+    Analytics ekrani dagilim hesabi icin yalnizca siniflandirilmis turlari
+    kullanir. CSV ise raporun eksik gorunmemesi icin siniflandirilmamis eski
+    kayitlari da bos intent/outcome alanlariyla dahil eder.
+    """
+    days = max(1, min(int(days), 365))
+    limit = max(1, min(int(limit), 5000))
+    since = _now() - timedelta(days=days)
+    docs = list(
+        _get_db().collection(COL_CHAT_LOGS)
+        .where(filter=FieldFilter("created_at", ">=", since))
+        .order_by("created_at", direction=firestore.Query.DESCENDING)
+        .limit(limit)
+        .stream()
+    )
+    rows = []
+    for doc in docs:
+        data = doc.to_dict() or {}
+        rows.append({
+            "id": doc.id,
+            "created_at": _iso(data.get("created_at")),
+            "session_id": data.get("session_id"),
+            "recording_id": data.get("recording_id"),
+            "user_id": data.get("user_id"),
+            "username": data.get("username"),
+            "channel": data.get("channel"),
+            "input_type": data.get("input_type"),
+            "user_message": data.get("user_message"),
+            "bot_response": data.get("bot_response"),
+            "recommended_movies": data.get("recommended_movies") or [],
+            "classification_status": (
+                "siniflandirildi"
+                if data.get("intent") and data.get("outcome")
+                else "siniflandirilmadi"
+            ),
+            "intent": data.get("intent"),
+            "outcome": data.get("outcome"),
+            "intent_confidence": data.get("intent_confidence"),
+            "outcome_confidence": data.get("outcome_confidence"),
+            "classification_version": data.get("classification_version"),
+            "classification_reason": data.get("classification_reason"),
+            "error_stage": data.get("error_stage"),
+            "error_type": data.get("error_type"),
+        })
+    return rows
 
 
 def _format_session_admin_row(doc_id, data):

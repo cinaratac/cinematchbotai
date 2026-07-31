@@ -301,44 +301,38 @@ def monitoring_config():
 @require_admin_key
 def overview_csv_report():
     days = _bounded_int_arg("days", 30, 1, 90)
-    data = db.get_admin_overview(days=days)
-    generated_at = datetime.now(timezone.utc).isoformat()
-    rows = []
-
-    general_metrics = (
-        ("total_sessions", "Toplam oturum", "adet"),
-        ("active_sessions", "Aktif oturum", "adet"),
-        ("total_messages", "Toplam mesaj", "adet"),
-        ("total_users", "Benzersiz kullanici", "adet"),
-        ("total_tool_calls", "Tool cagrisi", "adet"),
-        ("successful_tool_calls", "Basarili tool cagrisi", "adet"),
-        ("failed_tool_calls", "Basarisiz tool cagrisi", "adet"),
-        ("avg_rating", "Ortalama puan", "puan/5"),
-        ("total_evaluations", "Degerlendirme", "adet"),
-        ("classified_messages", "Siniflandirilan tur", "adet"),
-        ("success_rate", "Basari orani", "yuzde"),
-        ("fallback_rate", "Fallback orani", "yuzde"),
-        ("technical_error_rate", "Teknik hata orani", "yuzde"),
+    data = db.get_admin_report_summary(days=days)
+    headers = (
+        "donem_baslangici_utc", "donem_bitisi_utc", "donem_gun",
+        "toplam_oturum", "aktif_oturum", "toplam_mesaj",
+        "benzersiz_kullanici", "tool_cagrisi", "basarili_tool_cagrisi",
+        "basarisiz_tool_cagrisi", "tool_basari_orani_yuzde",
+        "ortalama_puan", "degerlendirme_sayisi", "siniflandirilan_mesaj",
+        "siniflandirilmayan_mesaj", "basari_orani_yuzde",
+        "fallback_orani_yuzde", "teknik_hata_orani_yuzde",
+        "en_yogun_niyet", "en_yogun_niyet_adedi", "en_sik_sonuc",
+        "en_sik_sonuc_adedi", "en_cok_sorgulanan_film",
+        "film_sorgu_adedi", "veri_sinirlandirildi",
     )
-    for key, label, unit in general_metrics:
-        rows.append(("genel", label, "", data.get(key), unit, days, generated_at))
-
-    for item in data.get("daily_messages", []):
-        rows.append(("gunluk_mesaj", "Mesaj hacmi", item.get("day"), item.get("c"), "adet", days, generated_at))
-    for item in data.get("intent_distribution", []):
-        rows.append(("intent", "Kullanici niyeti", item.get("intent"), item.get("count"), "adet", days, generated_at))
-    for item in data.get("outcome_distribution", []):
-        rows.append(("outcome", "Islem sonucu", item.get("outcome"), item.get("count"), "adet", days, generated_at))
-    for item in data.get("rating_distribution", []):
-        rows.append(("puan", "Puan dagilimi", item.get("rating"), item.get("c"), "adet", days, generated_at))
-    for item in data.get("top_movies", []):
-        rows.append(("film", item.get("movie_name"), "sorgu_sayisi", item.get("c"), "adet", days, generated_at))
-        rows.append(("film", item.get("movie_name"), "ortalama_tool_suresi", item.get("avg_duration_ms"), "ms", days, generated_at))
+    values = (
+        data.get("period_start"), data.get("period_end"), data.get("days"),
+        data.get("total_sessions"), data.get("active_sessions"),
+        data.get("total_messages"), data.get("total_users"),
+        data.get("total_tool_calls"), data.get("successful_tool_calls"),
+        data.get("failed_tool_calls"), data.get("tool_success_rate"),
+        data.get("avg_rating"), data.get("total_evaluations"),
+        data.get("classified_messages"), data.get("unclassified_messages"),
+        data.get("success_rate"), data.get("fallback_rate"),
+        data.get("technical_error_rate"), data.get("top_intent"),
+        data.get("top_intent_count"), data.get("top_outcome"),
+        data.get("top_outcome_count"), data.get("top_movie"),
+        data.get("top_movie_count"), data.get("data_truncated"),
+    )
 
     return _csv_response(
         f"cinebot-genel-rapor-{days}-gun.csv",
-        ("bolum", "metrik", "boyut", "deger", "birim", "donem_gun", "olusturulma_zamani_utc"),
-        rows,
+        headers,
+        [values],
     )
 
 
@@ -370,23 +364,18 @@ def performance_csv_report():
 def outcomes_csv_report():
     days = _bounded_int_arg("days", 30, 1, 365)
     limit = _bounded_int_arg("limit", 5000, 1, 5000)
-    analytics = db.get_outcome_analytics_admin(
-        days=days,
-        limit=limit,
-        scan_limit=limit,
-    )
+    rows = db.get_outcome_rows_export_admin(days=days, limit=limit)
     headers = (
-        "id", "created_at", "session_id", "channel", "input_type", "intent",
-        "outcome", "intent_confidence", "outcome_confidence",
-        "classification_version", "error_stage", "error_type",
+        "id", "created_at", "session_id", "recording_id", "user_id",
+        "username", "channel", "input_type", "user_message", "bot_response",
+        "recommended_movies", "classification_status", "intent", "outcome",
+        "intent_confidence", "outcome_confidence", "classification_version",
+        "classification_reason", "error_stage", "error_type",
     )
     return _csv_response(
         f"cinebot-sonuclar-{days}-gun.csv",
         headers,
-        (
-            [row.get(header) for header in headers]
-            for row in analytics.get("recent_interactions", [])
-        ),
+        ([row.get(header) for header in headers] for row in rows),
     )
 
 
