@@ -57,7 +57,32 @@ degiskeni ve Prometheus secret dosyasi kullanin.
 
 ## Render ve Grafana Cloud
 
-Onerilen canli ortam mimarisi:
+### Render Free: uygulamadan dogrudan OTLP
+
+Render Metrics Stream Pro gerektiriyorsa CineBot metric ve loglari uygulamadan
+dogrudan Grafana Cloud'a gonderebilir. Grafana Cloud `OpenTelemetry > Configure`
+ekranindaki degerleri Render web servisinin Environment bolumune ekleyin:
+
+```text
+OTEL_EXPORTER_OTLP_ENDPOINT=https://<grafana-otlp-host>/otlp
+OTEL_EXPORTER_OTLP_HEADERS=Authorization=Basic%20<GRAFANA_DEGERI>
+OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+OTEL_SERVICE_NAME=cinebot-api
+CINEBOT_ENVIRONMENT=production
+OTEL_METRIC_EXPORT_INTERVAL=15000
+```
+
+Bu degerler tanimliysa uygulama ozel `cinebot.*` metriklerini ve Python log
+kayitlarini OTLP/HTTP ile gonderir. Tanimli degilse exporter devre disi kalir;
+Prometheus `/metrics` endpoint'i calismaya devam eder. Header degerini repoya
+yazmayin; Render secret/environment alani kullanin.
+
+Bu ucretsiz yol Render platformunun CPU, disk ve network metriklerini icermez.
+Onlar icin Render Pro Metrics Stream gerekir.
+
+### Render Pro / collector mimarisi
+
+Alternatif canli ortam mimarisi:
 
 1. Render Pro veya ustunde `Observability > Metrics Stream` ile CPU, RAM,
    network, HTTP ve disk metriklerini Grafana Cloud endpoint'ine gonderin.

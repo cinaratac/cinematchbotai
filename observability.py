@@ -20,6 +20,12 @@ from prometheus_client import (
 )
 
 from logging_config import set_request_id
+from otel_config import (
+    record_active_voice_connections as record_otel_active_voice_connections,
+    record_http_request as record_otel_http_request,
+    record_performance_metric as record_otel_performance_metric,
+    record_tool_call as record_otel_tool_call,
+)
 
 
 HTTP_REQUESTS = Counter(
@@ -92,6 +98,12 @@ def observe_http_request(method, route, status_code, duration_seconds):
     status_code = str(status_code or 0)
     HTTP_REQUESTS.labels(method, route, status_code).inc()
     HTTP_DURATION.labels(method, route).observe(max(0.0, duration_seconds))
+    record_otel_http_request(
+        method,
+        route,
+        status_code,
+        max(0.0, duration_seconds),
+    )
 
 
 def observe_performance_metric(metric):
@@ -101,24 +113,37 @@ def observe_performance_metric(metric):
     outcome = _label(metric.get("outcome"), "unknown")
     PERFORMANCE_RECORDS.labels(channel, status, failed_stage, outcome).inc()
 
+    otel_durations = {}
     for field in _DURATION_FIELDS:
         value = metric.get(field)
         if isinstance(value, (int, float)) and not isinstance(value, bool):
-            PIPELINE_DURATION.labels(channel, field, status).observe(
-                max(0.0, value / 1000)
-            )
+            duration_seconds = max(0.0, value / 1000)
+            PIPELINE_DURATION.labels(channel, field, status).observe(duration_seconds)
+            otel_durations[field] = duration_seconds
+    record_otel_performance_metric(
+        channel,
+        status,
+        failed_stage,
+        outcome,
+        otel_durations,
+    )
 
 
 def observe_tool_call(tool_name, duration_ms, success):
     tool = _label(tool_name, "unknown_tool")
     status = "success" if success else "error"
     TOOL_CALLS.labels(tool, status).inc()
+    duration_seconds = None
     if isinstance(duration_ms, (int, float)) and not isinstance(duration_ms, bool):
-        TOOL_DURATION.labels(tool, status).observe(max(0.0, duration_ms / 1000))
+        duration_seconds = max(0.0, duration_ms / 1000)
+        TOOL_DURATION.labels(tool, status).observe(duration_seconds)
+    record_otel_tool_call(tool, status, duration_seconds)
 
 
 def set_active_voice_connections(count):
-    ACTIVE_VOICE_CONNECTIONS.set(max(0, int(count)))
+    count = max(0, int(count))
+    ACTIVE_VOICE_CONNECTIONS.set(count)
+    record_otel_active_voice_connections(count)
 
 
 def _metrics_authorized():

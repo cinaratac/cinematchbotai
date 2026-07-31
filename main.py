@@ -5,8 +5,10 @@ import time
 from io import BytesIO
 
 from logging_config import configure_logging
+from otel_config import configure_otel
 
 configure_logging()
+configure_otel()
 
 import telebot
 from flask import Flask, request, jsonify

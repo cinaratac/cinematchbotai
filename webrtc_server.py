@@ -2,8 +2,10 @@ import os
 import logging
 
 from logging_config import configure_logging
+from otel_config import configure_otel
 
 configure_logging()
+configure_otel()
 
 from aiohttp import web
 
