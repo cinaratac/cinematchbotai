@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+cinemabot.db
+var/log/*.log*
+var/finetune/
+.env
+.env.*
+notes.txt
+firebase-service-account.json
+.DS_Store
+tempCodeRunnerFile.py
